@@ -1,0 +1,74 @@
+import sys
+import tensorrt as trt
+
+
+TRT_LOGGER = trt.Logger(trt.Logger.INFO)
+
+
+def test_engine(path):
+
+    print()
+    print("=" * 80)
+    print("TensorRT Engine Deserialize Test")
+    print("=" * 80)
+
+    print()
+    print("Engine:")
+    print(" ", path)
+
+    runtime = trt.Runtime(TRT_LOGGER)
+
+    print()
+    print("[1] Reading engine...")
+
+    with open(path, "rb") as f:
+        engine_data = f.read()
+
+    print("    size:",
+          len(engine_data) / 1024 / 1024,
+          "MB")
+
+    print()
+    print("[2] Deserializing...")
+
+    engine = runtime.deserialize_cuda_engine(
+        engine_data
+    )
+
+    if engine is None:
+        print("[FAIL] Engine deserialize failed")
+        return False
+
+    print("[PASS] Engine deserialized")
+
+    print()
+    print("[3] Engine I/O")
+
+    for i in range(engine.num_io_tensors):
+
+        name = engine.get_tensor_name(i)
+
+        print()
+        print(" ", name)
+        print("    mode :",
+              engine.get_tensor_mode(name))
+        print("    dtype:",
+              engine.get_tensor_dtype(name))
+        print("    shape:",
+              tuple(engine.get_tensor_shape(name)))
+
+    return True
+
+
+if __name__ == "__main__":
+
+    if len(sys.argv) != 2:
+        print(
+            "Usage: python test_trt_engine.py "
+            "<engine>"
+        )
+        sys.exit(1)
+
+    ok = test_engine(sys.argv[1])
+
+    sys.exit(0 if ok else 1)
