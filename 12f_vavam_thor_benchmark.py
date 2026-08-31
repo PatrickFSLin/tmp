@@ -1054,15 +1054,11 @@ def main():
     cuda_check(result, "cuDeviceGet")
     device = result[1]
 
-    result = driver.cuDeviceGetName(device)
-    cuda_check(result, "cuDeviceGetName")
-
-    device_name = result[1]
-    if isinstance(device_name, bytes):
-        device_name = device_name.decode()
-
+    # cuda.bindings.driver.cuDeviceGetName() has different call signatures
+    # across CUDA Python versions. Avoid relying on it for the benchmark;
+    # the device index is sufficient.
     print()
-    print(f"CUDA Device: {device_name}")
+    print(f"CUDA Device index: {device}")
 
     # ------------------------------------------------------------
     # Reference
