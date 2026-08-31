@@ -1,90 +1,117 @@
 #!/usr/bin/env python3
-
 """
-VaVAM Thor Benchmark
-====================
+VaVAM Thor B/L Precision + Latency Benchmark
 
-Benchmark:
+Benchmarks:
     VaVAM-B / VaVAM-L
-    FP32 + TF32
-    FP32 + no-TF32
+    FP32 + TF32 allowed
+    FP32 + TF32 disabled
     FP16
     BF16
 
 Measures:
-    1. TensorRT GPU latency
-    2. End-to-end latency (H2D + TensorRT + D2H)
-    3. Output accuracy vs PyTorch reference
+    - H2D latency
+    - TensorRT GPU execution latency
+    - D2H latency
+    - End-to-end latency
+    - Output accuracy vs PC PyTorch reference
 
-Expected reference:
+Reference:
     thor_inference_step_reference.npz
 
-Expected keys:
+Expected reference keys:
     visual_tokens
     noisy_actions
     high_level_command
     diffusion_step
     action_velocity
+
+IMPORTANT:
+    This script assumes the engine input/output tensor names contain
+    the corresponding logical names. If your existing 12e script uses
+    exact names that differ, adjust INPUT_ALIASES / OUTPUT_ALIASES below.
 """
 
-import os
+import gc
 import time
 from pathlib import Path
 
 import numpy as np
 import tensorrt as trt
-
 from cuda.bindings import driver
 
 
-# ============================================================
-# Paths
-# ============================================================
+# ============================================================================
+# Configuration
+# ============================================================================
 
 ROOT = Path("/home/delta_drc/vblkdev2/VaVAM_Thor")
 
 REFERENCE_PATH = ROOT / "thor_inference_step_reference.npz"
 
-
-# ============================================================
-# Engine configuration
-# ============================================================
-
+# Use the actual ONNX sources currently used on Thor.
+# Existing FP32 engines from your current setup are retained.
 ENGINES = {
     "B": {
         "FP32_TF32": ROOT / "vavam_joint_inference_step_B_fp32.engine",
-        "FP32":      ROOT / "vavam_joint_inference_step_B_fp32_noTF32.engine",
-        "FP16":      ROOT / "vavam_joint_inference_step_B_fp16.engine",
-        "BF16":      ROOT / "vavam_joint_inference_step_B_bf16.engine",
+        "FP32_noTF32": ROOT / "vavam_joint_inference_step_B_fp32_noTF32.engine",
+        "FP16": ROOT / "vavam_joint_inference_step_B_fp16.engine",
+        "BF16": ROOT / "vavam_joint_inference_step_B_bf16.engine",
     },
-
     "L": {
         "FP32_TF32": ROOT / "vavam_joint_inference_step_L_fp32.engine",
-        "FP32":      ROOT / "vavam_joint_inference_step_L_fp32_noTF32.engine",
-        "FP16":      ROOT / "vavam_joint_inference_step_L_fp16.engine",
-        "BF16":      ROOT / "vavam_joint_inference_step_L_bf16.engine",
+        "FP32_noTF32": ROOT / "vavam_joint_inference_step_L_fp32_noTF32.engine",
+        "FP16": ROOT / "vavam_joint_inference_step_L_fp16.engine",
+        "BF16": ROOT / "vavam_joint_inference_step_L_bf16.engine",
     },
 }
-
-
-# ============================================================
-# Benchmark parameters
-# ============================================================
 
 WARMUP = 20
 ITERATIONS = 100
 
-
-# ============================================================
-# Logger
-# ============================================================
+# Ignore the first few measured samples when calculating stable statistics.
+# Set to 0 if you want every iteration included.
+DROP_FIRST = 5
 
 TRT_LOGGER = trt.Logger(trt.Logger.WARNING)
 
 
-# ============================================================
+# ============================================================================
+# Logical tensor name aliases
+# ============================================================================
+
+INPUT_ALIASES = {
+    "visual_tokens": [
+        "visual_tokens",
+        "visual_token",
+    ],
+    "noisy_actions": [
+        "noisy_actions",
+        "noisy_action",
+    ],
+    "high_level_command": [
+        "high_level_command",
+        "high_level_commands",
+        "command",
+    ],
+    "diffusion_step": [
+        "diffusion_step",
+        "diffusion_steps",
+        "timestep",
+        "timesteps",
+    ],
+}
+
+OUTPUT_ALIASES = [
+    "action_velocity",
+    "action_velocities",
+    "action",
+]
+
+
+# ============================================================================
 # CUDA helpers
-# ============================================================
+# ============================================================================
 
 def cuda_check(result, name):
     if isinstance(result, tuple):
@@ -107,38 +134,49 @@ def cuda_malloc(nbytes):
 def cuda_free(ptr):
     if ptr is None:
         return
-
     result = driver.cuMemFree(ptr)
     cuda_check(result, "cuMemFree")
 
 
 def cuda_memcpy_htod(ptr, host_array):
     arr = np.ascontiguousarray(host_array)
-
     result = driver.cuMemcpyHtoD(
         int(ptr),
         arr,
         int(arr.nbytes),
     )
-
     cuda_check(result, "cuMemcpyHtoD")
 
 
 def cuda_memcpy_dtoh(host_array, ptr):
     arr = np.ascontiguousarray(host_array)
-
     result = driver.cuMemcpyDtoH(
         arr,
         int(ptr),
         int(arr.nbytes),
     )
-
     cuda_check(result, "cuMemcpyDtoH")
 
 
-# ============================================================
-# TensorRT utilities
-# ============================================================
+def cuda_sync():
+    result = driver.cuCtxSynchronize()
+    cuda_check(result, "cuCtxSynchronize")
+
+
+# ============================================================================
+# TensorRT dtype helpers
+# ============================================================================
+
+def is_bf16_dtype(dtype):
+    return hasattr(trt.DataType, "BF16") and dtype == trt.DataType.BF16
+
+
+def trt_dtype_name(dtype):
+    try:
+        return str(dtype)
+    except Exception:
+        return repr(dtype)
+
 
 def trt_dtype_to_numpy(dtype):
     if dtype == trt.DataType.FLOAT:
@@ -147,8 +185,10 @@ def trt_dtype_to_numpy(dtype):
     if dtype == trt.DataType.HALF:
         return np.float16
 
-    if hasattr(trt.DataType, "BF16") and dtype == trt.DataType.BF16:
-        return np.dtype("bfloat16")
+    if is_bf16_dtype(dtype):
+        # Do NOT assume NumPy has native bfloat16.
+        # BF16 is handled separately by make_host_array().
+        return None
 
     if dtype == trt.DataType.INT8:
         return np.int8
@@ -165,515 +205,518 @@ def trt_dtype_to_numpy(dtype):
     raise RuntimeError(f"Unsupported TensorRT dtype: {dtype}")
 
 
-def print_engine_info(engine, name):
-    print()
-    print("=" * 80)
-    print(f"Engine: {name}")
-    print("=" * 80)
+def make_host_array(source, shape, dtype, tensor_name):
+    """
+    Create a C-contiguous host array suitable for the TensorRT binding.
 
-    # TensorRT 10.x
-    if hasattr(engine, "num_io_tensors"):
+    BF16 handling:
+      - If NumPy provides native bfloat16, use it.
+      - Otherwise use uint16 storage containing the raw BF16 bits.
 
-        for i in range(engine.num_io_tensors):
-            tensor_name = engine.get_tensor_name(i)
-            mode = engine.get_tensor_mode(tensor_name)
-            dtype = engine.get_tensor_dtype(tensor_name)
-            shape = engine.get_tensor_shape(tensor_name)
+    CUDA copies bytes only, so the uint16 representation preserves the
+    exact BF16 bit pattern without requiring NumPy bfloat16 support.
+    """
 
-            print(
-                f"{'INPUT ' if mode == trt.TensorIOMode.INPUT else 'OUTPUT'} "
-                f"{tensor_name:30s} "
-                f"{str(shape):25s} "
-                f"{dtype}"
+    source = np.asarray(source)
+
+    if is_bf16_dtype(dtype):
+        # Native NumPy bfloat16, if available.
+        try:
+            bf16_dtype = np.dtype("bfloat16")
+            arr = np.asarray(source, dtype=bf16_dtype)
+            arr = np.ascontiguousarray(arr)
+
+            if tuple(arr.shape) != tuple(shape):
+                raise RuntimeError(
+                    f"Shape mismatch for BF16 tensor '{tensor_name}': "
+                    f"engine={shape}, input={arr.shape}"
+                )
+
+            return arr
+
+        except TypeError:
+            # No native NumPy BF16: create raw BF16 uint16 representation.
+            f32 = np.asarray(source, dtype=np.float32)
+
+            if tuple(f32.shape) != tuple(shape):
+                raise RuntimeError(
+                    f"Shape mismatch for BF16 tensor '{tensor_name}': "
+                    f"engine={shape}, input={f32.shape}"
+                )
+
+            f32 = np.ascontiguousarray(f32)
+
+            # BF16 is the upper 16 bits of IEEE FP32.
+            # Round-to-nearest-even before truncation.
+            u32 = f32.view(np.uint32)
+            rounding = ((u32 >> 16) & 1) + 0x7FFF
+            bf16_bits = ((u32 + rounding) >> 16).astype(
+                np.uint16,
+                copy=False,
             )
 
-    # TensorRT 8.x
-    else:
+            return np.ascontiguousarray(bf16_bits)
 
-        for i in range(engine.num_bindings):
-            binding_name = engine.get_binding_name(i)
-            dtype = engine.get_binding_dtype(i)
-            shape = engine.get_binding_shape(i)
-            is_input = engine.binding_is_input(i)
+    np_dtype = trt_dtype_to_numpy(dtype)
 
-            print(
-                f"{'INPUT ' if is_input else 'OUTPUT'} "
-                f"{binding_name:30s} "
-                f"{str(shape):25s} "
-                f"{dtype}"
-            )
+    arr = np.asarray(source, dtype=np_dtype)
+    arr = np.ascontiguousarray(arr)
 
-
-# ============================================================
-# Load reference
-# ============================================================
-
-def load_reference():
-
-    if not REFERENCE_PATH.exists():
-        raise FileNotFoundError(
-            f"Reference file not found:\n{REFERENCE_PATH}"
+    if tuple(arr.shape) != tuple(shape):
+        raise RuntimeError(
+            f"Shape mismatch for tensor '{tensor_name}': "
+            f"engine={shape}, input={arr.shape}"
         )
 
-    data = np.load(REFERENCE_PATH)
-
-    required_keys = [
-        "visual_tokens",
-        "noisy_actions",
-        "high_level_command",
-        "diffusion_step",
-        "action_velocity",
-    ]
-
-    print()
-    print("=" * 80)
-    print("Reference")
-    print("=" * 80)
-
-    for key in required_keys:
-
-        if key not in data:
-            raise KeyError(
-                f"Missing reference key: {key}"
-            )
-
-        x = data[key]
-
-        print(
-            f"{key:25s} "
-            f"shape={x.shape} "
-            f"dtype={x.dtype}"
-        )
-
-    return data
+    return arr
 
 
-# ============================================================
-# Tensor name matching
-# ============================================================
+def make_output_host_array(shape, dtype):
+    """
+    Allocate host storage for an output tensor.
+
+    For BF16 without native NumPy support, use uint16 raw BF16 storage.
+    """
+    if is_bf16_dtype(dtype):
+        try:
+            return np.empty(shape, dtype=np.dtype("bfloat16"))
+        except TypeError:
+            return np.empty(shape, dtype=np.uint16)
+
+    np_dtype = trt_dtype_to_numpy(dtype)
+    return np.empty(shape, dtype=np_dtype)
+
+
+def bf16_host_to_float32(arr):
+    """
+    Convert a BF16 host representation (native bfloat16 or uint16 raw bits)
+    to float32 for accuracy comparison.
+    """
+    if arr.dtype == np.uint16:
+        u32 = arr.astype(np.uint32) << 16
+        return u32.view(np.float32)
+
+    return np.asarray(arr, dtype=np.float32)
+
+
+def output_to_float32(arr, dtype):
+    if is_bf16_dtype(dtype):
+        return bf16_host_to_float32(arr)
+
+    return np.asarray(arr, dtype=np.float32)
+
+
+# ============================================================================
+# TensorRT engine utilities
+# ============================================================================
 
 def normalize_name(name):
-    return name.lower().replace("_", "").replace(".", "")
+    return (
+        str(name)
+        .lower()
+        .replace("_", "")
+        .replace(".", "")
+        .replace("-", "")
+    )
 
 
-def find_tensor_name(engine, target, is_input=True):
+def get_io_tensor_names(engine):
+    if hasattr(engine, "num_io_tensors"):
+        return [
+            engine.get_tensor_name(i)
+            for i in range(engine.num_io_tensors)
+        ]
 
-    target_norm = normalize_name(target)
+    return [
+        engine.get_binding_name(i)
+        for i in range(engine.num_bindings)
+    ]
 
+
+def get_tensor_mode(engine, name):
+    if hasattr(engine, "get_tensor_mode"):
+        return engine.get_tensor_mode(name)
+
+    index = engine.get_binding_index(name)
+    return (
+        trt.TensorIOMode.INPUT
+        if engine.binding_is_input(index)
+        else trt.TensorIOMode.OUTPUT
+    )
+
+
+def get_tensor_dtype(engine, name):
+    if hasattr(engine, "get_tensor_dtype"):
+        return engine.get_tensor_dtype(name)
+
+    index = engine.get_binding_index(name)
+    return engine.get_binding_dtype(index)
+
+
+def get_tensor_shape(engine, name):
+    if hasattr(engine, "get_tensor_shape"):
+        return tuple(engine.get_tensor_shape(name))
+
+    index = engine.get_binding_index(name)
+    return tuple(engine.get_binding_shape(index))
+
+
+def find_tensor_name(engine, aliases, is_input):
     candidates = []
 
-    if hasattr(engine, "num_io_tensors"):
+    for name in get_io_tensor_names(engine):
+        mode = get_tensor_mode(engine, name)
 
-        for i in range(engine.num_io_tensors):
+        if is_input and mode != trt.TensorIOMode.INPUT:
+            continue
 
-            name = engine.get_tensor_name(i)
-            mode = engine.get_tensor_mode(name)
+        if not is_input and mode != trt.TensorIOMode.OUTPUT:
+            continue
 
-            if is_input and mode != trt.TensorIOMode.INPUT:
-                continue
+        candidates.append(name)
 
-            if not is_input and mode != trt.TensorIOMode.OUTPUT:
-                continue
+    normalized_candidates = {
+        name: normalize_name(name)
+        for name in candidates
+    }
 
-            candidates.append(name)
+    # Exact normalized match first.
+    for alias in aliases:
+        alias_norm = normalize_name(alias)
 
-    else:
+        for name, norm in normalized_candidates.items():
+            if norm == alias_norm:
+                return name
 
-        for i in range(engine.num_bindings):
+    # Then substring match.
+    for alias in aliases:
+        alias_norm = normalize_name(alias)
 
-            name = engine.get_binding_name(i)
-
-            if engine.binding_is_input(i) != is_input:
-                continue
-
-            candidates.append(name)
-
-    # Exact normalized match
-    for name in candidates:
-        if normalize_name(name) == target_norm:
-            return name
-
-    # Partial match
-    for name in candidates:
-        if target_norm in normalize_name(name):
-            return name
+        for name, norm in normalized_candidates.items():
+            if alias_norm in norm:
+                return name
 
     return None
 
 
-# ============================================================
-# TensorRT Engine wrapper
-# ============================================================
+def print_engine_info(engine, engine_path):
+    print()
+    print("=" * 90)
+    print(f"Engine: {engine_path.name}")
+    print("=" * 90)
+
+    for name in get_io_tensor_names(engine):
+        mode = get_tensor_mode(engine, name)
+        dtype = get_tensor_dtype(engine, name)
+        shape = get_tensor_shape(engine, name)
+
+        io = (
+            "INPUT "
+            if mode == trt.TensorIOMode.INPUT
+            else "OUTPUT"
+        )
+
+        print(
+            f"{io:7s} "
+            f"{name:35s} "
+            f"shape={str(shape):25s} "
+            f"dtype={trt_dtype_name(dtype)}"
+        )
+
+
+# ============================================================================
+# TensorRT wrapper
+# ============================================================================
 
 class TensorRTEngine:
-
     def __init__(self, engine_path):
-
         self.engine_path = Path(engine_path)
-
-        print()
-        print(f"Loading engine:")
-        print(f"  {self.engine_path}")
 
         if not self.engine_path.exists():
             raise FileNotFoundError(
                 f"Engine not found: {self.engine_path}"
             )
 
+        print()
+        print(f"Loading engine: {self.engine_path}")
+
         with open(self.engine_path, "rb") as f:
             engine_data = f.read()
 
         self.runtime = trt.Runtime(TRT_LOGGER)
-
-        self.engine = self.runtime.deserialize_cuda_engine(
-            engine_data
-        )
+        self.engine = self.runtime.deserialize_cuda_engine(engine_data)
 
         if self.engine is None:
             raise RuntimeError(
-                f"Failed to deserialize engine:\n"
-                f"{self.engine_path}"
+                f"Failed to deserialize engine: {self.engine_path}"
             )
 
         self.context = self.engine.create_execution_context()
 
-        print_engine_info(
-            self.engine,
-            self.engine_path.name
-        )
+        if self.context is None:
+            raise RuntimeError(
+                f"Failed to create TensorRT execution context: "
+                f"{self.engine_path}"
+            )
 
-        self.input_names = {
-            "visual_tokens":
-                find_tensor_name(
-                    self.engine,
-                    "visual_tokens",
-                    True
-                ),
+        print_engine_info(self.engine, self.engine_path)
 
-            "noisy_actions":
-                find_tensor_name(
-                    self.engine,
-                    "noisy_actions",
-                    True
-                ),
+        self.input_names = {}
+        for logical_name, aliases in INPUT_ALIASES.items():
+            tensor_name = find_tensor_name(
+                self.engine,
+                aliases,
+                is_input=True,
+            )
 
-            "high_level_command":
-                find_tensor_name(
-                    self.engine,
-                    "high_level_command",
-                    True
-                ),
+            if tensor_name is None:
+                raise RuntimeError(
+                    f"Cannot find TensorRT input for "
+                    f"'{logical_name}'. "
+                    f"Available inputs: "
+                    f"{[n for n in get_io_tensor_names(self.engine) "
+                    f"if get_tensor_mode(self.engine, n) == trt.TensorIOMode.INPUT]}"
+                )
 
-            "diffusion_step":
-                find_tensor_name(
-                    self.engine,
-                    "diffusion_step",
-                    True
-                ),
-        }
+            self.input_names[logical_name] = tensor_name
 
         self.output_name = find_tensor_name(
             self.engine,
-            "action_velocity",
-            False
+            OUTPUT_ALIASES,
+            is_input=False,
         )
-
-        print()
-        print("Tensor mapping:")
-        print(self.input_names)
-        print("output:", self.output_name)
-
-        for key, name in self.input_names.items():
-            if name is None:
-                raise RuntimeError(
-                    f"Cannot find TensorRT input for: {key}"
-                )
 
         if self.output_name is None:
             raise RuntimeError(
-                "Cannot find TensorRT output: action_velocity"
+                "Cannot find TensorRT output 'action_velocity'. "
+                f"Available outputs: "
+                f"{[n for n in get_io_tensor_names(self.engine) "
+                f"if get_tensor_mode(self.engine, n) != trt.TensorIOMode.INPUT]}"
             )
 
-        self.allocate_buffers()
-
-    # --------------------------------------------------------
-    # Tensor metadata
-    # --------------------------------------------------------
-
-    def get_dtype(self, name):
-
-        if hasattr(self.engine, "get_tensor_dtype"):
-            return self.engine.get_tensor_dtype(name)
-
-        index = self.engine.get_binding_index(name)
-        return self.engine.get_binding_dtype(index)
-
-    def get_shape(self, name):
-
-        if hasattr(self.engine, "get_tensor_shape"):
-            return tuple(self.engine.get_tensor_shape(name))
-
-        index = self.engine.get_binding_index(name)
-        return tuple(self.engine.get_binding_shape(index))
-
-    # --------------------------------------------------------
-    # Buffer allocation
-    # --------------------------------------------------------
-
-    def allocate_buffers(self):
+        print()
+        print("Logical tensor mapping:")
+        for logical, actual in self.input_names.items():
+            print(f"  {logical:22s} -> {actual}")
+        print(f"  {'action_velocity':22s} -> {self.output_name}")
 
         self.device_buffers = {}
-        self.host_outputs = {}
+        self.output_host = None
 
-        tensor_names = []
+        self._allocate_buffers()
 
-        if hasattr(self.engine, "num_io_tensors"):
+    def _allocate_buffers(self):
+        for name in get_io_tensor_names(self.engine):
+            shape = get_tensor_shape(self.engine, name)
+            dtype = get_tensor_dtype(self.engine, name)
 
-            for i in range(self.engine.num_io_tensors):
-                tensor_names.append(
-                    self.engine.get_tensor_name(i)
-                )
-
-        else:
-
-            for i in range(self.engine.num_bindings):
-                tensor_names.append(
-                    self.engine.get_binding_name(i)
-                )
-
-        for name in tensor_names:
-
-            dtype = self.get_dtype(name)
-            shape = self.get_shape(name)
-
-            # Dynamic shape safety
             if any(dim < 0 for dim in shape):
                 raise RuntimeError(
-                    f"Dynamic shape not resolved for {name}: {shape}"
+                    f"Dynamic/unresolved shape for '{name}': {shape}. "
+                    "This benchmark expects fixed shapes like the existing 12e."
                 )
 
-            np_dtype = trt_dtype_to_numpy(dtype)
+            # Size in bytes is determined from the TRT dtype.
+            if is_bf16_dtype(dtype):
+                itemsize = 2
+            else:
+                np_dtype = trt_dtype_to_numpy(dtype)
+                itemsize = np.dtype(np_dtype).itemsize
 
-            size = int(np.prod(shape))
+            nbytes = int(np.prod(shape)) * itemsize
 
-            dummy = np.empty(
-                size,
-                dtype=np_dtype
-            )
-
-            ptr = cuda_malloc(dummy.nbytes)
+            ptr = cuda_malloc(nbytes)
 
             self.device_buffers[name] = {
                 "ptr": ptr,
                 "shape": shape,
-                "dtype": np_dtype,
-                "nbytes": dummy.nbytes,
+                "dtype": dtype,
+                "nbytes": nbytes,
             }
 
             if name == self.output_name:
-
-                self.host_outputs[name] = np.empty(
+                self.output_host = make_output_host_array(
                     shape,
-                    dtype=np_dtype
+                    dtype,
                 )
 
-    # --------------------------------------------------------
-    # Prepare input
-    # --------------------------------------------------------
+    def prepare_inputs(self, inputs):
+        prepared = {}
 
-    def prepare_input(self, tensor_name, array):
+        for logical_name, tensor_name in self.input_names.items():
+            info = self.device_buffers[tensor_name]
 
-        info = self.device_buffers[tensor_name]
-
-        expected_shape = tuple(info["shape"])
-        expected_dtype = info["dtype"]
-
-        array = np.asarray(array)
-
-        if tuple(array.shape) != expected_shape:
-            raise RuntimeError(
-                f"Shape mismatch for {tensor_name}\n"
-                f"Engine : {expected_shape}\n"
-                f"Input  : {array.shape}"
+            prepared[logical_name] = make_host_array(
+                inputs[logical_name],
+                info["shape"],
+                info["dtype"],
+                tensor_name,
             )
 
-        array = np.ascontiguousarray(
-            array.astype(
-                expected_dtype,
-                copy=False
+        return prepared
+
+    def set_tensor_addresses(self):
+        if not hasattr(self.context, "set_tensor_address"):
+            return
+
+        for name, info in self.device_buffers.items():
+            ok = self.context.set_tensor_address(
+                name,
+                int(info["ptr"]),
             )
-        )
 
-        return array
+            if ok is False:
+                raise RuntimeError(
+                    f"set_tensor_address failed for '{name}'"
+                )
 
-    # --------------------------------------------------------
-    # Execute
-    # --------------------------------------------------------
+    def execute_trt(self):
+        """
+        Launch only TensorRT execution.
 
-    def execute(self, inputs):
-
-        # ----------------------------------------------------
-        # TensorRT 10.x
-        # ----------------------------------------------------
-
+        Returns after GPU completion so the measured interval represents
+        TensorRT GPU execution, not asynchronous enqueue time.
+        """
         if hasattr(self.context, "set_tensor_address"):
+            self.set_tensor_addresses()
 
-            for key, tensor_name in self.input_names.items():
+            ok = self.context.execute_async_v3(0)
 
-                arr = self.prepare_input(
-                    tensor_name,
-                    inputs[key]
-                )
-
-                cuda_memcpy_htod(
-                    self.device_buffers[tensor_name]["ptr"],
-                    arr
-                )
-
-                self.context.set_tensor_address(
-                    tensor_name,
-                    int(self.device_buffers[tensor_name]["ptr"])
-                )
-
-            self.context.set_tensor_address(
-                self.output_name,
-                int(
-                    self.device_buffers[
-                        self.output_name
-                    ]["ptr"]
-                )
-            )
-
-            success = self.context.execute_async_v3(
-                0
-            )
-
-            if not success:
+            if not ok:
                 raise RuntimeError(
                     "TensorRT execute_async_v3 failed"
                 )
 
-        # ----------------------------------------------------
-        # TensorRT 8.x
-        # ----------------------------------------------------
-
         else:
-
             bindings = [0] * self.engine.num_bindings
 
-            for key, tensor_name in self.input_names.items():
+            for name, info in self.device_buffers.items():
+                index = self.engine.get_binding_index(name)
+                bindings[index] = int(info["ptr"])
 
-                arr = self.prepare_input(
-                    tensor_name,
-                    inputs[key]
-                )
-
-                cuda_memcpy_htod(
-                    self.device_buffers[tensor_name]["ptr"],
-                    arr
-                )
-
-                index = self.engine.get_binding_index(
-                    tensor_name
-                )
-
-                bindings[index] = int(
-                    self.device_buffers[tensor_name]["ptr"]
-                )
-
-            output_index = self.engine.get_binding_index(
-                self.output_name
-            )
-
-            bindings[output_index] = int(
-                self.device_buffers[
-                    self.output_name
-                ]["ptr"]
-            )
-
-            success = self.context.execute_async_v2(
+            ok = self.context.execute_async_v2(
                 bindings=bindings,
-                stream_handle=0
+                stream_handle=0,
             )
 
-            if not success:
+            if not ok:
                 raise RuntimeError(
                     "TensorRT execute_async_v2 failed"
                 )
 
-        # Synchronize because this validation script
-        # uses the default CUDA stream.
-        result = driver.cuCtxSynchronize()
+        cuda_sync()
 
-        cuda_check(
-            result,
-            "cuCtxSynchronize"
-        )
+    def run_once(self, inputs):
+        """
+        One complete H2D -> TRT -> D2H execution.
 
-        output = self.host_outputs[self.output_name]
+        Returns:
+            output_float32,
+            h2d_ms,
+            trt_ms,
+            d2h_ms,
+            e2e_ms
+        """
+        t0 = time.perf_counter()
+
+        prepared = self.prepare_inputs(inputs)
+
+        # H2D
+        h2d_start = time.perf_counter()
+
+        for logical_name, tensor_name in self.input_names.items():
+            cuda_memcpy_htod(
+                self.device_buffers[tensor_name]["ptr"],
+                prepared[logical_name],
+            )
+
+        cuda_sync()
+
+        h2d_end = time.perf_counter()
+
+        # TensorRT
+        trt_start = time.perf_counter()
+
+        self.execute_trt()
+
+        trt_end = time.perf_counter()
+
+        # D2H
+        d2h_start = time.perf_counter()
 
         cuda_memcpy_dtoh(
-            output,
-            self.device_buffers[
-                self.output_name
-            ]["ptr"]
+            self.output_host,
+            self.device_buffers[self.output_name]["ptr"],
         )
 
-        return np.array(
-            output,
-            copy=True
+        cuda_sync()
+
+        d2h_end = time.perf_counter()
+
+        t1 = time.perf_counter()
+
+        output_dtype = get_tensor_dtype(
+            self.engine,
+            self.output_name,
         )
 
-    # --------------------------------------------------------
-    # Cleanup
-    # --------------------------------------------------------
+        output_float32 = output_to_float32(
+            np.array(self.output_host, copy=True),
+            output_dtype,
+        )
 
-    def __del__(self):
+        return (
+            output_float32,
+            (h2d_end - h2d_start) * 1000.0,
+            (trt_end - trt_start) * 1000.0,
+            (d2h_end - d2h_start) * 1000.0,
+            (t1 - t0) * 1000.0,
+        )
+
+    def close(self):
+        for info in self.device_buffers.values():
+            try:
+                cuda_free(info["ptr"])
+            except Exception:
+                pass
+
+        self.device_buffers.clear()
 
         try:
+            del self.context
+        except Exception:
+            pass
 
-            for info in self.device_buffers.values():
-                cuda_free(info["ptr"])
+        try:
+            del self.engine
+        except Exception:
+            pass
 
+        try:
+            del self.runtime
         except Exception:
             pass
 
 
-# ============================================================
-# Accuracy comparison
-# ============================================================
+# ============================================================================
+# Accuracy
+# ============================================================================
 
 def compare_outputs(reference, test):
-
-    reference = np.asarray(
-        reference,
-        dtype=np.float32
-    )
-
-    test = np.asarray(
-        test,
-        dtype=np.float32
-    )
+    reference = np.asarray(reference, dtype=np.float32)
+    test = np.asarray(test, dtype=np.float32)
 
     if reference.shape != test.shape:
-
         raise RuntimeError(
             "Output shape mismatch:\n"
-            f"reference = {reference.shape}\n"
-            f"test      = {test.shape}"
+            f"  reference = {reference.shape}\n"
+            f"  test      = {test.shape}"
         )
 
-    diff = np.abs(
-        reference - test
-    )
+    diff = np.abs(reference - test)
 
-    max_abs = float(
-        diff.max()
-    )
-
-    mean_abs = float(
-        diff.mean()
-    )
+    max_abs = float(np.max(diff))
+    mean_abs = float(np.mean(diff))
 
     rmse = float(
         np.sqrt(
@@ -683,20 +726,15 @@ def compare_outputs(reference, test):
         )
     )
 
-    denom = np.maximum(
-        np.abs(reference),
-        1e-8
-    )
+    denom = np.maximum(np.abs(reference), 1e-8)
 
     max_rel = float(
-        np.max(
-            diff / denom
-        )
+        np.max(diff / denom)
     )
 
     max_index = np.unravel_index(
         np.argmax(diff),
-        diff.shape
+        diff.shape,
     )
 
     return {
@@ -705,423 +743,429 @@ def compare_outputs(reference, test):
         "rmse": rmse,
         "max_rel": max_rel,
         "max_index": max_index,
-        "reference_at_max": float(
-            reference[max_index]
-        ),
-        "test_at_max": float(
-            test[max_index]
-        ),
+        "reference_at_max": float(reference[max_index]),
+        "test_at_max": float(test[max_index]),
     }
 
 
-# ============================================================
-# Latency benchmark
-# ============================================================
+# ============================================================================
+# Statistics
+# ============================================================================
 
-def benchmark_engine(
-    engine,
-    inputs,
-    reference_output,
-    warmup=WARMUP,
-    iterations=ITERATIONS,
-):
+def stats(values):
+    x = np.asarray(values, dtype=np.float64)
 
-    print()
-    print(
-        f"Warmup: {warmup}, "
-        f"Iterations: {iterations}"
-    )
-
-    # --------------------------------------------------------
-    # Warmup
-    # --------------------------------------------------------
-
-    for _ in range(warmup):
-
-        engine.execute(inputs)
-
-    # --------------------------------------------------------
-    # Synchronize before timing
-    # --------------------------------------------------------
-
-    cuda_check(
-        driver.cuCtxSynchronize(),
-        "cuCtxSynchronize"
-    )
-
-    # --------------------------------------------------------
-    # End-to-end timing
-    # --------------------------------------------------------
-
-    e2e_times = []
-
-    output = None
-
-    for _ in range(iterations):
-
-        t0 = time.perf_counter()
-
-        output = engine.execute(inputs)
-
-        t1 = time.perf_counter()
-
-        e2e_times.append(
-            (t1 - t0) * 1000.0
-        )
-
-    e2e_times = np.asarray(
-        e2e_times,
-        dtype=np.float64
-    )
-
-    # --------------------------------------------------------
-    # Accuracy
-    # --------------------------------------------------------
-
-    accuracy = compare_outputs(
-        reference_output,
-        output
-    )
-
-    # --------------------------------------------------------
-    # Statistics
-    # --------------------------------------------------------
-
-    # Remove first few samples from latency statistics
-    # to avoid residual startup effects.
-    stable = e2e_times
+    if x.size == 0:
+        raise RuntimeError("No benchmark samples")
 
     return {
-        "e2e_mean": float(np.mean(stable)),
-        "e2e_median": float(np.median(stable)),
-        "e2e_p95": float(np.percentile(stable, 95)),
-        "e2e_min": float(np.min(stable)),
-        "e2e_max": float(np.max(stable)),
-        "accuracy": accuracy,
+        "mean": float(np.mean(x)),
+        "median": float(np.median(x)),
+        "p95": float(np.percentile(x, 95)),
+        "min": float(np.min(x)),
+        "max": float(np.max(x)),
     }
 
 
-# ============================================================
+# ============================================================================
+# Reference
+# ============================================================================
+
+def load_reference():
+    if not REFERENCE_PATH.exists():
+        raise FileNotFoundError(
+            f"Reference file not found: {REFERENCE_PATH}"
+        )
+
+    data = np.load(REFERENCE_PATH)
+
+    required = [
+        "visual_tokens",
+        "noisy_actions",
+        "high_level_command",
+        "diffusion_step",
+        "action_velocity",
+    ]
+
+    for key in required:
+        if key not in data:
+            raise KeyError(
+                f"Missing reference key: {key}"
+            )
+
+    print()
+    print("=" * 90)
+    print("Reference")
+    print("=" * 90)
+
+    for key in required:
+        x = data[key]
+        print(
+            f"{key:25s} "
+            f"shape={str(x.shape):25s} "
+            f"dtype={x.dtype}"
+        )
+
+    return data
+
+
+# ============================================================================
+# Benchmark one engine
+# ============================================================================
+
+def benchmark_engine(
+    model_name,
+    precision_name,
+    engine_path,
+    inputs,
+    reference_output,
+):
+    print()
+    print()
+    print("#" * 90)
+    print(f"# {model_name} / {precision_name}")
+    print("#" * 90)
+
+    if not engine_path.exists():
+        print(f"SKIP: engine not found: {engine_path}")
+
+        return {
+            "model": model_name,
+            "precision": precision_name,
+            "status": "SKIP",
+        }
+
+    engine = None
+
+    try:
+        engine = TensorRTEngine(engine_path)
+
+        # ------------------------------------------------------------
+        # Warmup
+        # ------------------------------------------------------------
+
+        print()
+        print(
+            f"Warmup={WARMUP}, "
+            f"Iterations={ITERATIONS}, "
+            f"Drop first={DROP_FIRST}"
+        )
+
+        for i in range(WARMUP):
+            engine.run_once(inputs)
+
+        cuda_sync()
+
+        # ------------------------------------------------------------
+        # Benchmark
+        # ------------------------------------------------------------
+
+        h2d = []
+        trt_gpu = []
+        d2h = []
+        e2e = []
+
+        last_output = None
+
+        for _ in range(ITERATIONS):
+            (
+                last_output,
+                h2d_ms,
+                trt_ms,
+                d2h_ms,
+                e2e_ms,
+            ) = engine.run_once(inputs)
+
+            h2d.append(h2d_ms)
+            trt_gpu.append(trt_ms)
+            d2h.append(d2h_ms)
+            e2e.append(e2e_ms)
+
+        # ------------------------------------------------------------
+        # Remove startup samples if requested
+        # ------------------------------------------------------------
+
+        start = min(DROP_FIRST, len(h2d))
+
+        h2d = h2d[start:]
+        trt_gpu = trt_gpu[start:]
+        d2h = d2h[start:]
+        e2e = e2e[start:]
+
+        h2d_s = stats(h2d)
+        trt_s = stats(trt_gpu)
+        d2h_s = stats(d2h)
+        e2e_s = stats(e2e)
+
+        # ------------------------------------------------------------
+        # Accuracy
+        # ------------------------------------------------------------
+
+        accuracy = compare_outputs(
+            reference_output,
+            last_output,
+        )
+
+        # ------------------------------------------------------------
+        # Print
+        # ------------------------------------------------------------
+
+        print()
+        print("-" * 90)
+        print(f"{model_name} / {precision_name}")
+        print("-" * 90)
+
+        print()
+        print("Latency [ms]")
+        print(
+            f"  H2D          mean={h2d_s['mean']:.3f}  "
+            f"median={h2d_s['median']:.3f}  "
+            f"P95={h2d_s['p95']:.3f}"
+        )
+        print(
+            f"  TensorRT GPU mean={trt_s['mean']:.3f}  "
+            f"median={trt_s['median']:.3f}  "
+            f"P95={trt_s['p95']:.3f}"
+        )
+        print(
+            f"  D2H          mean={d2h_s['mean']:.3f}  "
+            f"median={d2h_s['median']:.3f}  "
+            f"P95={d2h_s['p95']:.3f}"
+        )
+        print(
+            f"  E2E          mean={e2e_s['mean']:.3f}  "
+            f"median={e2e_s['median']:.3f}  "
+            f"P95={e2e_s['p95']:.3f}"
+        )
+
+        print()
+        print("Accuracy")
+        print(
+            f"  max abs error : "
+            f"{accuracy['max_abs']:.10e}"
+        )
+        print(
+            f"  mean abs error: "
+            f"{accuracy['mean_abs']:.10e}"
+        )
+        print(
+            f"  RMSE          : "
+            f"{accuracy['rmse']:.10e}"
+        )
+        print(
+            f"  max rel error : "
+            f"{accuracy['max_rel']:.10e}"
+        )
+        print(
+            f"  max error idx : "
+            f"{accuracy['max_index']}"
+        )
+        print(
+            f"  reference     : "
+            f"{accuracy['reference_at_max']:.10e}"
+        )
+        print(
+            f"  TensorRT      : "
+            f"{accuracy['test_at_max']:.10e}"
+        )
+
+        return {
+            "model": model_name,
+            "precision": precision_name,
+            "status": "OK",
+
+            "h2d_mean_ms": h2d_s["mean"],
+            "h2d_median_ms": h2d_s["median"],
+            "h2d_p95_ms": h2d_s["p95"],
+
+            "trt_mean_ms": trt_s["mean"],
+            "trt_median_ms": trt_s["median"],
+            "trt_p95_ms": trt_s["p95"],
+
+            "d2h_mean_ms": d2h_s["mean"],
+            "d2h_median_ms": d2h_s["median"],
+            "d2h_p95_ms": d2h_s["p95"],
+
+            "e2e_mean_ms": e2e_s["mean"],
+            "e2e_median_ms": e2e_s["median"],
+            "e2e_p95_ms": e2e_s["p95"],
+
+            "max_abs_error": accuracy["max_abs"],
+            "mean_abs_error": accuracy["mean_abs"],
+            "rmse": accuracy["rmse"],
+            "max_rel_error": accuracy["max_rel"],
+            "max_error_index": accuracy["max_index"],
+        }
+
+    except Exception as exc:
+        print()
+        print(
+            f"ERROR: {model_name} / {precision_name}"
+        )
+        print(
+            f"{type(exc).__name__}: {exc}"
+        )
+
+        return {
+            "model": model_name,
+            "precision": precision_name,
+            "status": "ERROR",
+            "error": str(exc),
+        }
+
+    finally:
+        if engine is not None:
+            engine.close()
+
+        gc.collect()
+
+
+# ============================================================================
 # Main
-# ============================================================
+# ============================================================================
 
 def main():
+    print()
+    print("=" * 90)
+    print("VaVAM Thor B/L Precision + Latency Benchmark")
+    print("=" * 90)
 
     print()
-    print("=" * 80)
-    print("VaVAM Thor Benchmark")
-    print("=" * 80)
+    print(f"ROOT      : {ROOT}")
+    print(f"REFERENCE : {REFERENCE_PATH}")
+    print(f"WARMUP    : {WARMUP}")
+    print(f"ITERATIONS: {ITERATIONS}")
+    print(f"DROP_FIRST: {DROP_FIRST}")
 
-    print()
-    print(f"Reference:")
-    print(f"  {REFERENCE_PATH}")
-
-    # --------------------------------------------------------
-    # CUDA init
-    # --------------------------------------------------------
+    # ------------------------------------------------------------
+    # CUDA initialization
+    # ------------------------------------------------------------
 
     cuda_check(
         driver.cuInit(0),
-        "cuInit"
+        "cuInit",
     )
 
     result = driver.cuDeviceGet(0)
-
-    cuda_check(
-        result,
-        "cuDeviceGet"
-    )
-
+    cuda_check(result, "cuDeviceGet")
     device = result[1]
 
     result = driver.cuDeviceGetName(device)
-
-    cuda_check(
-        result,
-        "cuDeviceGetName"
-    )
+    cuda_check(result, "cuDeviceGetName")
 
     device_name = result[1]
-
     if isinstance(device_name, bytes):
         device_name = device_name.decode()
 
     print()
     print(f"CUDA Device: {device_name}")
 
-    # --------------------------------------------------------
+    # ------------------------------------------------------------
     # Reference
-    # --------------------------------------------------------
+    # ------------------------------------------------------------
 
     reference = load_reference()
 
     inputs = {
-        "visual_tokens":
-            reference["visual_tokens"],
-
-        "noisy_actions":
-            reference["noisy_actions"],
-
-        "high_level_command":
-            reference["high_level_command"],
-
-        "diffusion_step":
-            reference["diffusion_step"],
+        "visual_tokens": reference["visual_tokens"],
+        "noisy_actions": reference["noisy_actions"],
+        "high_level_command": reference["high_level_command"],
+        "diffusion_step": reference["diffusion_step"],
     }
 
-    reference_output = reference[
-        "action_velocity"
-    ]
+    reference_output = reference["action_velocity"]
 
-    # --------------------------------------------------------
-    # Results
-    # --------------------------------------------------------
+    # ------------------------------------------------------------
+    # Run all 8 configurations
+    # ------------------------------------------------------------
 
     results = []
 
-    # --------------------------------------------------------
-    # Benchmark all models
-    # --------------------------------------------------------
-
-    for model_name in ["B", "L"]:
-
-        for precision in [
+    for model_name in ("B", "L"):
+        for precision_name in (
             "FP32_TF32",
-            "FP32",
+            "FP32_noTF32",
             "FP16",
             "BF16",
-        ]:
-
-            engine_path = ENGINES[
-                model_name
-            ][precision]
-
-            print()
-            print()
-            print("#" * 80)
-            print(
-                f"# {model_name} / {precision}"
+        ):
+            result = benchmark_engine(
+                model_name=model_name,
+                precision_name=precision_name,
+                engine_path=ENGINES[model_name][precision_name],
+                inputs=inputs,
+                reference_output=reference_output,
             )
-            print("#" * 80)
 
-            if not engine_path.exists():
+            results.append(result)
 
-                print(
-                    f"SKIP: engine not found:\n"
-                    f"  {engine_path}"
-                )
-
-                results.append({
-                    "model": model_name,
-                    "precision": precision,
-                    "status": "SKIP",
-                })
-
-                continue
-
-            try:
-
-                engine = TensorRTEngine(
-                    engine_path
-                )
-
-                stats = benchmark_engine(
-                    engine,
-                    inputs,
-                    reference_output,
-                )
-
-                acc = stats["accuracy"]
-
-                result = {
-                    "model":
-                        model_name,
-
-                    "precision":
-                        precision,
-
-                    "status":
-                        "OK",
-
-                    "e2e_mean_ms":
-                        stats["e2e_mean"],
-
-                    "e2e_median_ms":
-                        stats["e2e_median"],
-
-                    "e2e_p95_ms":
-                        stats["e2e_p95"],
-
-                    "e2e_min_ms":
-                        stats["e2e_min"],
-
-                    "e2e_max_ms":
-                        stats["e2e_max"],
-
-                    "max_abs_error":
-                        acc["max_abs"],
-
-                    "mean_abs_error":
-                        acc["mean_abs"],
-
-                    "rmse":
-                        acc["rmse"],
-
-                    "max_rel_error":
-                        acc["max_rel"],
-
-                    "max_error_index":
-                        acc["max_index"],
-                }
-
-                results.append(result)
-
-                # ------------------------------------------------
-                # Print result
-                # ------------------------------------------------
-
-                print()
-                print("-" * 80)
-                print(
-                    f"{model_name} / {precision}"
-                )
-                print("-" * 80)
-
-                print()
-                print("Latency")
-                print(
-                    f"  E2E mean   : "
-                    f"{stats['e2e_mean']:.3f} ms"
-                )
-
-                print(
-                    f"  E2E median : "
-                    f"{stats['e2e_median']:.3f} ms"
-                )
-
-                print(
-                    f"  E2E P95    : "
-                    f"{stats['e2e_p95']:.3f} ms"
-                )
-
-                print(
-                    f"  E2E min    : "
-                    f"{stats['e2e_min']:.3f} ms"
-                )
-
-                print(
-                    f"  E2E max    : "
-                    f"{stats['e2e_max']:.3f} ms"
-                )
-
-                print()
-                print("Accuracy")
-                print(
-                    f"  max abs    : "
-                    f"{acc['max_abs']:.10e}"
-                )
-
-                print(
-                    f"  mean abs   : "
-                    f"{acc['mean_abs']:.10e}"
-                )
-
-                print(
-                    f"  RMSE       : "
-                    f"{acc['rmse']:.10e}"
-                )
-
-                print(
-                    f"  max rel    : "
-                    f"{acc['max_rel']:.10e}"
-                )
-
-                print(
-                    f"  max index  : "
-                    f"{acc['max_index']}"
-                )
-
-                print(
-                    f"  reference  : "
-                    f"{acc['reference_at_max']:.10e}"
-                )
-
-                print(
-                    f"  TensorRT   : "
-                    f"{acc['test_at_max']:.10e}"
-                )
-
-                del engine
-
-            except Exception as e:
-
-                print()
-                print(
-                    f"ERROR: "
-                    f"{model_name} / {precision}"
-                )
-
-                print(
-                    f"{type(e).__name__}: {e}"
-                )
-
-                results.append({
-                    "model": model_name,
-                    "precision": precision,
-                    "status": "ERROR",
-                    "error": str(e),
-                })
-
-    # ========================================================
+    # ------------------------------------------------------------
     # Final summary
-    # ========================================================
+    # ------------------------------------------------------------
 
     print()
     print()
-    print("=" * 110)
+    print("=" * 150)
     print("FINAL SUMMARY")
-    print("=" * 110)
+    print("=" * 150)
 
     print()
-
     print(
-        f"{'Model':<8}"
-        f"{'Precision':<14}"
+        f"{'Model':<7}"
+        f"{'Precision':<16}"
         f"{'Status':<8}"
-        f"{'E2E Mean(ms)':>15}"
-        f"{'Median(ms)':>15}"
-        f"{'P95(ms)':>15}"
-        f"{'Max Abs':>15}"
+        f"{'H2D':>10}"
+        f"{'TRT GPU':>12}"
+        f"{'D2H':>10}"
+        f"{'E2E':>10}"
+        f"{'MaxAbs':>15}"
         f"{'RMSE':>15}"
     )
 
-    print("-" * 110)
+    print("-" * 150)
 
     for r in results:
-
         if r["status"] != "OK":
-
             print(
-                f"{r['model']:<8}"
-                f"{r['precision']:<14}"
+                f"{r['model']:<7}"
+                f"{r['precision']:<16}"
                 f"{r['status']:<8}"
             )
-
             continue
 
         print(
-            f"{r['model']:<8}"
-            f"{r['precision']:<14}"
+            f"{r['model']:<7}"
+            f"{r['precision']:<16}"
             f"{r['status']:<8}"
-            f"{r['e2e_mean_ms']:>15.3f}"
-            f"{r['e2e_median_ms']:>15.3f}"
-            f"{r['e2e_p95_ms']:>15.3f}"
+            f"{r['h2d_mean_ms']:>10.3f}"
+            f"{r['trt_mean_ms']:>12.3f}"
+            f"{r['d2h_mean_ms']:>10.3f}"
+            f"{r['e2e_mean_ms']:>10.3f}"
             f"{r['max_abs_error']:>15.3e}"
             f"{r['rmse']:>15.3e}"
         )
 
     print()
-    print("=" * 110)
+    print("=" * 150)
+
+    # ------------------------------------------------------------
+    # Interpretation reminder
+    # ------------------------------------------------------------
+
+    print()
+    print("Notes:")
+    print("  FP32_TF32  = FP32 engine with TF32 allowed.")
+    print("  FP32_noTF32= FP32 engine with TF32 disabled.")
+    print("  FP16       = FP16-enabled TensorRT engine.")
+    print("  BF16       = BF16-enabled TensorRT engine.")
+    print()
+    print(
+        "  TensorRT GPU latency is measured from launch until "
+        "GPU synchronization completes."
+    )
+    print(
+        "  E2E latency includes host preparation + H2D + TensorRT + D2H "
+        "and Python timing overhead."
+    )
 
 
 if __name__ == "__main__":
