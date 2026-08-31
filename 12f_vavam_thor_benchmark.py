@@ -470,12 +470,14 @@ class TensorRTEngine:
             )
 
             if tensor_name is None:
+                available_inputs = [
+                    n for n in get_io_tensor_names(self.engine)
+                    if get_tensor_mode(self.engine, n) == trt.TensorIOMode.INPUT
+                ]
                 raise RuntimeError(
                     f"Cannot find TensorRT input for "
                     f"'{logical_name}'. "
-                    f"Available inputs: "
-                    f"{[n for n in get_io_tensor_names(self.engine) "
-                    f"if get_tensor_mode(self.engine, n) == trt.TensorIOMode.INPUT]}"
+                    f"Available inputs: {available_inputs}"
                 )
 
             self.input_names[logical_name] = tensor_name
@@ -487,11 +489,13 @@ class TensorRTEngine:
         )
 
         if self.output_name is None:
+            available_outputs = [
+                n for n in get_io_tensor_names(self.engine)
+                if get_tensor_mode(self.engine, n) != trt.TensorIOMode.INPUT
+            ]
             raise RuntimeError(
                 "Cannot find TensorRT output 'action_velocity'. "
-                f"Available outputs: "
-                f"{[n for n in get_io_tensor_names(self.engine) "
-                f"if get_tensor_mode(self.engine, n) != trt.TensorIOMode.INPUT]}"
+                f"Available outputs: {available_outputs}"
             )
 
         print()
