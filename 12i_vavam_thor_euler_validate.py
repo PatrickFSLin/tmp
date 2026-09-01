@@ -597,6 +597,11 @@ class TRTRunner:
                 name
             ] = ptr
 
+            print()
+            print("[TRT] Setting tensor addresses...")
+            self.set_addresses()
+            print("[OK] Tensor addresses configured")
+
             print(
                 f"  [OK] {name} "
                 f"shape={shape} "
