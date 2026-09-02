@@ -1,0 +1,31 @@
+echo "===== TensorRT ====="
+trtexec --version
+which trtexec
+
+echo "===== Python ====="
+python3 -c "import tensorrt as trt; print('TensorRT:', trt.__version__)"
+python3 -c "import numpy as np; print('NumPy:', np.__version__)"
+
+echo "===== CUDA ====="
+nvcc --version
+
+echo "===== Architecture ====="
+uname -m
+
+echo "===== Memory ====="
+free -h
+
+echo "===== Disk ====="
+df -h
+
+echo "===== CUDA libs ====="
+ls -ld /usr/local/cuda*
+
+echo "===== TensorRT libs ====="
+ldd $(which trtexec) | grep -E "cuda|cudart|nvinfer" | head -30
+
+echo "===== CUDA Python ====="
+python3 -c "import cuda; print('cuda-python: OK')" 2>&1 || true
+
+echo "===== tegrastats ====="
+tegrastats --interval 1000
