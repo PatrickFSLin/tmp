@@ -1,13 +1,5 @@
 """
-NumPy-only minADE implementation.
-
-Matches the semantics of VaVAM's torch min_ade():
-
-    pred_trajectory: [B, M, T, 2]
-    gt_trajectory:   [B, T, 2]
-
-For one sampled trajectory:
-    minADE == ADE
+NumPy-only implementation matching VaVAM min_ade().
 """
 
 import numpy as np
@@ -29,20 +21,16 @@ def min_ade(
     if pred.shape[0] != gt.shape[0]:
         raise ValueError(f"batch mismatch: {pred.shape} vs {gt.shape}")
     if pred.shape[-1] != 2 or gt.shape[-1] != 2:
-        raise ValueError(f"last dimension must be 2: {pred.shape}, {gt.shape}")
+        raise ValueError(f"last dim must be 2: {pred.shape}, {gt.shape}")
     if pred.shape[2] != gt.shape[1]:
         raise ValueError(f"time mismatch: {pred.shape} vs {gt.shape}")
 
-    # [B,T,2] -> [B,1,T,2]
-    diff = pred - gt[:, None, :, :]
+    distances = np.linalg.norm(
+        pred - gt[:, None, :, :],
+        axis=-1,
+    )
 
-    # Euclidean distance -> [B,M,T]
-    distances = np.linalg.norm(diff, axis=-1)
-
-    # Mean over T -> [B,M]
     ade = distances.mean(axis=-1)
-
-    # Best mode -> [B]
     best_idx = np.argmin(ade, axis=-1)
     best_ade = ade[np.arange(ade.shape[0]), best_idx]
 
@@ -54,8 +42,7 @@ def min_ade(
         loss = best_ade
     else:
         raise ValueError(
-            f"Unsupported reduction={reduction}; "
-            "expected mean, sum, or none."
+            f"Unsupported reduction={reduction}"
         )
 
     if return_idx:
