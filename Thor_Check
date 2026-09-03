@@ -1,57 +1,38 @@
-python3 - <<'PY'
-p = "12i_vavam_B_gpu_resident_e2e_v2.py"
+ptx_size_result = nvrtc.nvrtcGetPTXSize(program)
 
-s = open(p, "r").read()
+ptx_size_err = (
+    ptx_size_result[0]
+    if isinstance(ptx_size_result, tuple)
+    else ptx_size_result
+)
 
-old = '''    if err != nvrtc.nvrtcResult.NVRTC_SUCCESS:
-        log_result = nvrtc.nvrtcGetProgramLog(program)
-        log = log_result[1] if isinstance(log_result, tuple) else str(log_result)
-        raise RuntimeError(f"NVRTC compilation failed:\\n{log}")
-'''
+if ptx_size_err != nvrtc.nvrtcResult.NVRTC_SUCCESS:
+    raise RuntimeError(
+        f"nvrtcGetPTXSize failed: {ptx_size_result}"
+    )
 
-new = '''    if err != nvrtc.nvrtcResult.NVRTC_SUCCESS:
-        # cuda.bindings NVRTC API requires:
-        #   nvrtcGetProgramLogSize(program)
-        #   nvrtcGetProgramLog(program, buffer)
-        size_result = nvrtc.nvrtcGetProgramLogSize(program)
-        size_err = size_result[0] if isinstance(size_result, tuple) else size_result
+ptx_size = (
+    ptx_size_result[1]
+    if isinstance(ptx_size_result, tuple)
+    else None
+)
 
-        if size_err != nvrtc.nvrtcResult.NVRTC_SUCCESS:
-            raise RuntimeError(
-                f"NVRTC compilation failed: {err}; "
-                f"also failed to get compiler log: {size_err}"
-            )
+ptx_buffer = bytearray(ptx_size)
 
-        log_size = size_result[1]
-        log_buffer = bytearray(log_size)
+ptx_result = nvrtc.nvrtcGetPTX(
+    program,
+    ptx_buffer,
+)
 
-        log_result = nvrtc.nvrtcGetProgramLog(
-            program,
-            log_buffer,
-        )
+ptx_err = (
+    ptx_result[0]
+    if isinstance(ptx_result, tuple)
+    else ptx_result
+)
 
-        log_err = log_result[0] if isinstance(log_result, tuple) else log_result
+if ptx_err != nvrtc.nvrtcResult.NVRTC_SUCCESS:
+    raise RuntimeError(
+        f"nvrtcGetPTX failed: {ptx_result}"
+    )
 
-        if log_err != nvrtc.nvrtcResult.NVRTC_SUCCESS:
-            log_text = f"<unable to retrieve NVRTC log: {log_err}>"
-        else:
-            log_text = bytes(log_buffer).rstrip(b"\\\\x00").decode(
-                "utf-8",
-                errors="replace",
-            )
-
-        raise RuntimeError(
-            f"NVRTC compilation failed: {err}\\\\n"
-            f"Compiler log:\\\\n{log_text}"
-        )
-'''
-
-if old not in s:
-    raise SystemExit("Target block not found; file may differ.")
-
-s = s.replace(old, new)
-
-open(p, "w").write(s)
-
-print("[OK] Patched NVRTC compiler-log handling")
-PY
+ptx = bytes(ptx_buffer)
