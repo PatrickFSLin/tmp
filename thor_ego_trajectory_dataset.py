@@ -1,55 +1,47 @@
 """
-Minimal nuScenes EgoTrajectoryDataset for VaVAM evaluation on DRIVE AGX Thor.
+Minimal nuScenes ego-trajectory dataset loader for DRIVE AGX Thor.
 
-This is intentionally standalone and does NOT import the full VideoActionModel
-repository. It loads:
-  - nuscenes_mini_data_cleaned.pkl
-  - precomputed visual-token .npy files
+IMPORTANT:
+- No PyTorch.
+- No torchvision / PIL.
+- No full VideoActionModel repository.
+- Returns NumPy arrays so they can be passed directly to the existing
+  TensorRT / cuda-python inference pipeline.
 
-The data-processing semantics are kept aligned with the official
-vam/datalib/ego_trajectory_dataset.py for the fields needed by trajectory
-evaluation:
-  visual_tokens
-  high_level_command
-  positions
-  window_idx
+Required data:
+    nuscenes_mini_data_cleaned.pkl
+    tokens/**/*.npy
 """
 
 import os
 import pickle
-from enum import IntEnum
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List
 
 import numpy as np
-import torch
-from pyquaternion import Quaternion
-from torch.utils.data import Dataset
 
 
-class HighLevelCommand(IntEnum):
+class HighLevelCommand:
     RIGHT = 0
     LEFT = 1
     STRAIGHT = 2
     FOLLOW_REFERENCE = 3
 
 
-class ThorEgoTrajectoryDataset(Dataset):
+class ThorEgoTrajectoryDataset:
     """
-    Minimal standalone implementation of the official EgoTrajectoryDataset.
+    Minimal NumPy-only equivalent for the fields needed by trajectory eval.
 
-    Expected pickle structure:
-        pickle_data = list of records
-        record["scene"]
-        record["camera"]
-        record["ego_pose"]
-        record["path"]
-        ...
+    Output of dataset[idx]:
+        visual_tokens       : np.ndarray, integer
+        high_level_command  : np.int64 scalar
+        positions           : np.float32 [6, 2]
+        window_idx          : np.int64 [14]
 
-    Defaults match the evaluation dataset configuration used by the PC code:
-        camera="CAM_FRONT"
-        sequence_length=8
-        action_length=6
-        subsampling_factor=1
+    The default sequence configuration follows the PC evaluation:
+        8 observation frames
+        6 future frames
+        subsampling factor = 1
+        CAM_FRONT
     """
 
     def __init__(
@@ -71,14 +63,9 @@ class ThorEgoTrajectoryDataset(Dataset):
         self.command_distance_threshold = command_distance_threshold
 
         if not os.path.isfile(self.pickle_path):
-            raise FileNotFoundError(
-                f"Pickle file not found: {self.pickle_path}"
-            )
-
+            raise FileNotFoundError(self.pickle_path)
         if not os.path.isdir(self.tokens_rootdir):
-            raise FileNotFoundError(
-                f"Tokens directory not found: {self.tokens_rootdir}"
-            )
+            raise FileNotFoundError(self.tokens_rootdir)
 
         with open(self.pickle_path, "rb") as f:
             self.pickle_data = pickle.load(f)
@@ -97,13 +84,8 @@ class ThorEgoTrajectoryDataset(Dataset):
         camera = record["camera"]
         if isinstance(camera, dict):
             return str(camera.get("channel", camera.get("name", "")))
-        return str(
-            getattr(
-                camera,
-                "channel",
-                getattr(camera, "name", camera),
-            )
-        )
+        return str(getattr(camera, "channel",
+                           getattr(camera, "name", camera)))
 
     @staticmethod
     def _timestamp(record: Dict[str, Any]) -> int:
@@ -121,119 +103,157 @@ class ThorEgoTrajectoryDataset(Dataset):
         return np.asarray(value, dtype=np.float64)
 
     @staticmethod
-    def _pose_rotation(ego_pose: Any) -> Quaternion:
+    def _pose_rotation(ego_pose: Any) -> np.ndarray:
+        """
+        Return quaternion as [w, x, y, z].
+
+        nuScenes / pyquaternion convention is [w, x, y, z].
+        """
         if isinstance(ego_pose, dict):
             value = ego_pose["rotation"]
         else:
             value = ego_pose.rotation
 
-        if isinstance(value, Quaternion):
-            return value
+        # pyquaternion-like object
+        if hasattr(value, "elements"):
+            value = value.elements
 
-        return Quaternion(value)
+        q = np.asarray(value, dtype=np.float64).reshape(-1)
+        if q.size != 4:
+            raise ValueError(
+                f"Expected quaternion with 4 elements, got shape {q.shape}"
+            )
+
+        # Official nuScenes/pyquaternion convention.
+        return q
 
     @staticmethod
-    def _get_field(record: Dict[str, Any], key: str) -> Any:
-        value = record[key]
-        return value
+    def _quat_conjugate(q: np.ndarray) -> np.ndarray:
+        return np.array([q[0], -q[1], -q[2], -q[3]], dtype=np.float64)
+
+    @staticmethod
+    def _quat_rotate(q: np.ndarray, v: np.ndarray) -> np.ndarray:
+        """
+        Rotate 3D vector v by unit quaternion q=[w,x,y,z].
+
+        Implemented directly with NumPy; no pyquaternion required.
+        """
+        q = np.asarray(q, dtype=np.float64)
+        v = np.asarray(v, dtype=np.float64)
+
+        w, x, y, z = q
+        qvec = np.array([x, y, z], dtype=np.float64)
+
+        # Equivalent to q * [0,v] * q^-1, optimized for vectors.
+        return (
+            2.0 * np.dot(qvec, v) * qvec
+            + (w * w - np.dot(qvec, qvec)) * v
+            + 2.0 * w * np.cross(qvec, v)
+        )
+
+    @classmethod
+    def _relative_position(
+        cls,
+        current_translation: np.ndarray,
+        current_rotation: np.ndarray,
+        target_translation: np.ndarray,
+    ) -> np.ndarray:
+        delta = np.asarray(target_translation) - np.asarray(current_translation)
+        return cls._quat_rotate(cls._quat_conjugate(current_rotation), delta)
 
     def _prepare_data(self):
-        # Keep the same basic ordering used by the official dataset:
-        # scene name, then camera timestamp.
         records = [
             r for r in self.pickle_data
             if self._camera_name(r) == self.camera_name
         ]
 
         records.sort(
-            key=lambda r: (
-                self._scene_name(r),
-                self._timestamp(r),
-            )
+            key=lambda r: (self._scene_name(r), self._timestamp(r))
         )
 
         self.data = records
 
-        # Group consecutive records by scene.
-        self.scene_indices: Dict[str, List[int]] = {}
+        scene_indices: Dict[str, List[int]] = {}
         for idx, record in enumerate(self.data):
             scene = self._scene_name(record)
-            self.scene_indices.setdefault(scene, []).append(idx)
+            scene_indices.setdefault(scene, []).append(idx)
 
-        # A valid sample contains 8 observation frames and 6 future action
-        # frames. With subsampling_factor=1 this is the same sequence layout
-        # used in the PC evaluation.
-        total = self.sequence_length + self.action_length
+        self.scene_indices = scene_indices
+
+        step = self.subsampling_factor
+        total_frames = self.sequence_length + self.action_length
+
+        # A window consists of:
+        #   8 observation frames + 6 future frames
+        # with the configured subsampling factor.
+        span = (total_frames - 1) * step + 1
+
         self.window_indices: List[List[int]] = []
 
         for indices in self.scene_indices.values():
-            if len(indices) < total:
+            if len(indices) < span:
                 continue
 
-            for start in range(0, len(indices) - total + 1):
-                window = indices[start:start + total]
-                self.window_indices.append(window)
+            for start in range(0, len(indices) - span + 1):
+                window = indices[start:start + span:step]
+                if len(window) == total_frames:
+                    self.window_indices.append(window)
 
-        if not self.window_indices:
-            raise RuntimeError(
-                "No valid evaluation sequences were found. "
-                f"records={len(self.data)}, "
-                f"sequence_length={self.sequence_length}, "
-                f"action_length={self.action_length}, "
-                f"camera={self.camera_name}"
-            )
-
-    def __len__(self) -> int:
+    def __len__(self):
         return len(self.window_indices)
 
-    def _token_path(self, record: Dict[str, Any]) -> str:
-        """
-        Resolve the token path from the same image/path naming convention used
-        by the official dataset: image .jpg -> token .npy.
-
-        The pickle may store the path as:
-          - record["path"]
-          - record["camera"]["path"]
-        """
-        path = record.get("path", None)
+    def _record_path(self, record: Dict[str, Any]) -> str:
+        path = record.get("path")
 
         if path is None and isinstance(record.get("camera"), dict):
-            path = record["camera"].get("path", None)
+            camera = record["camera"]
+            path = camera.get("path")
 
         if path is None:
             raise KeyError(
-                "Cannot find image path in pickle record; expected "
-                "record['path'] or record['camera']['path']."
+                "Cannot find image path. Expected record['path'] or "
+                "record['camera']['path']."
             )
 
-        path = os.path.expanduser(str(path))
-        token_rel = os.path.splitext(path)[0] + ".npy"
+        return os.path.expanduser(str(path))
 
-        # If pickle contains an absolute PC path, strip everything before the
-        # dataset token directory by using only the basename hierarchy when
-        # possible. First try the path exactly as stored under tokens_rootdir.
+    def _token_path(self, record: Dict[str, Any]) -> str:
+        image_path = self._record_path(record)
+        token_rel = os.path.splitext(image_path)[0] + ".npy"
+
+        candidates = []
+
         if os.path.isabs(token_rel):
-            candidates = [
-                token_rel,
-                os.path.join(
-                    self.tokens_rootdir,
-                    os.path.basename(token_rel),
-                ),
-            ]
+            candidates.append(token_rel)
+
+            # Handle PC absolute path such as:
+            # /home/patrick/VideoActionModel/data/nuScenes-mini/...
+            marker = "/nuScenes-mini/"
+            if marker in token_rel:
+                relative = token_rel.split(marker, 1)[1]
+                candidates.append(
+                    os.path.join(self.tokens_rootdir, relative)
+                )
         else:
-            candidates = [
-                os.path.join(self.tokens_rootdir, token_rel),
-                os.path.join(self.tokens_rootdir, path),
-            ]
+            candidates.append(
+                os.path.join(self.tokens_rootdir, token_rel)
+            )
 
-        for candidate in candidates:
-            if os.path.isfile(candidate):
-                return candidate
+        candidates.append(
+            os.path.join(
+                self.tokens_rootdir,
+                os.path.basename(token_rel),
+            )
+        )
 
-        # Common nuScenes layout: tokens_rootdir mirrors the relative path
-        # below the dataset root. Try locating the basename recursively.
+        for path in candidates:
+            if os.path.isfile(path):
+                return path
+
+        # Last resort: basename recursive search.
         basename = os.path.basename(token_rel)
         matches = []
+
         for root, _, files in os.walk(self.tokens_rootdir):
             if basename in files:
                 matches.append(os.path.join(root, basename))
@@ -242,57 +262,28 @@ class ThorEgoTrajectoryDataset(Dataset):
             return matches[0]
 
         raise FileNotFoundError(
-            "Visual token file not found.\n"
-            f"record path: {path}\n"
-            f"expected token basename: {basename}\n"
-            f"tokens_rootdir: {self.tokens_rootdir}\n"
-            f"tried: {candidates}"
+            "\nVisual token file not found.\n"
+            f"image path     : {image_path}\n"
+            f"token basename : {basename}\n"
+            f"tokens root    : {self.tokens_rootdir}\n"
+            f"candidates     : {candidates}\n"
+            f"recursive hits : {len(matches)}"
         )
 
-    def _load_visual_tokens(self, record: Dict[str, Any]) -> torch.Tensor:
-        token_path = self._token_path(record)
-        tokens = np.load(token_path)
+    def _load_visual_tokens(self, record: Dict[str, Any]) -> np.ndarray:
+        path = self._token_path(record)
+        tokens = np.load(path)
 
-        # Official evaluation feeds integer visual tokens.
-        if tokens.dtype != np.int64:
+        # PC VaVAM visual tokens are integer token IDs.
+        if not np.issubdtype(tokens.dtype, np.integer):
             tokens = tokens.astype(np.int64)
 
-        return torch.from_numpy(tokens)
-
-    def _compute_command(
-        self,
-        current_translation: np.ndarray,
-        current_rotation: Quaternion,
-        future_translation: np.ndarray,
-    ) -> int:
-        # Transform future position into the current ego frame.
-        relative = current_rotation.inverse.rotate(
-            future_translation - current_translation
-        )
-
-        if relative[1] > self.command_distance_threshold:
-            return int(HighLevelCommand.LEFT)
-        if relative[1] < -self.command_distance_threshold:
-            return int(HighLevelCommand.RIGHT)
-        return int(HighLevelCommand.STRAIGHT)
-
-    def _relative_position(
-        self,
-        current_translation: np.ndarray,
-        current_rotation: Quaternion,
-        target_translation: np.ndarray,
-    ) -> np.ndarray:
-        return current_rotation.inverse.rotate(
-            target_translation - current_translation
-        )
+        return np.ascontiguousarray(tokens.astype(np.int64, copy=False))
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         window = self.window_indices[idx]
 
-        # First 8 frames are observations. The last observation frame is the
-        # reference ego frame, matching the PC evaluation's batch["positions"]
-        # and high-level command usage.
-        obs_indices = window[: self.sequence_length]
+        obs_indices = window[:self.sequence_length]
         future_indices = window[
             self.sequence_length:
             self.sequence_length + self.action_length
@@ -304,34 +295,35 @@ class ThorEgoTrajectoryDataset(Dataset):
         ref_translation = self._pose_translation(ref_pose)
         ref_rotation = self._pose_rotation(ref_pose)
 
-        # Visual tokens for all 8 observation frames.
-        visual_tokens = []
-        for record_idx in obs_indices:
-            visual_tokens.append(
-                self._load_visual_tokens(self.data[record_idx])
-            )
+        visual_tokens = [
+            self._load_visual_tokens(self.data[i])
+            for i in obs_indices
+        ]
+        visual_tokens = np.stack(visual_tokens, axis=0)
 
-        visual_tokens = torch.stack(visual_tokens, dim=0).long()
+        # Official command logic:
+        # final future position in current ego frame
+        final_pose = self.data[future_indices[-1]]["ego_pose"]
+        final_translation = self._pose_translation(final_pose)
 
-        # High-level command is determined from the future trajectory.
-        # Use the final future pose, consistent with the official dataset's
-        # command construction.
-        future_final = self.data[future_indices[-1]]
-        future_final_translation = self._pose_translation(
-            future_final["ego_pose"]
-        )
-
-        command = self._compute_command(
+        relative_final = self._relative_position(
             ref_translation,
             ref_rotation,
-            future_final_translation,
+            final_translation,
         )
 
-        # Ground-truth future ego positions in the reference ego frame.
+        if relative_final[1] > self.command_distance_threshold:
+            command = HighLevelCommand.LEFT
+        elif relative_final[1] < -self.command_distance_threshold:
+            command = HighLevelCommand.RIGHT
+        else:
+            command = HighLevelCommand.STRAIGHT
+
         positions = []
-        for record_idx in future_indices:
-            pose = self.data[record_idx]["ego_pose"]
+        for i in future_indices:
+            pose = self.data[i]["ego_pose"]
             translation = self._pose_translation(pose)
+
             positions.append(
                 self._relative_position(
                     ref_translation,
@@ -340,25 +332,11 @@ class ThorEgoTrajectoryDataset(Dataset):
                 )
             )
 
-        positions = torch.from_numpy(
-            np.stack(positions, axis=0).astype(np.float32)
-        )
+        positions = np.asarray(positions, dtype=np.float32)
 
         return {
-            "positions": positions,
-            "high_level_command": torch.tensor(
-                command, dtype=torch.long
-            ),
+            "positions": positions[:, :2],
+            "high_level_command": np.int64(command),
             "visual_tokens": visual_tokens,
-            "window_idx": torch.tensor(window, dtype=torch.long),
+            "window_idx": np.asarray(window, dtype=np.int64),
         }
-
-
-def load_dataset(
-    pickle_path: str,
-    tokens_rootdir: str,
-) -> ThorEgoTrajectoryDataset:
-    return ThorEgoTrajectoryDataset(
-        pickle_path=pickle_path,
-        tokens_rootdir=tokens_rootdir,
-    )
