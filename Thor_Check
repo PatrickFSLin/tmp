@@ -1,31 +1,57 @@
-echo "===== TensorRT ====="
-trtexec --version
-which trtexec
+python3 - <<'PY'
+p = "12i_vavam_B_gpu_resident_e2e_v2.py"
 
-echo "===== Python ====="
-python3 -c "import tensorrt as trt; print('TensorRT:', trt.__version__)"
-python3 -c "import numpy as np; print('NumPy:', np.__version__)"
+s = open(p, "r").read()
 
-echo "===== CUDA ====="
-nvcc --version
+old = '''    if err != nvrtc.nvrtcResult.NVRTC_SUCCESS:
+        log_result = nvrtc.nvrtcGetProgramLog(program)
+        log = log_result[1] if isinstance(log_result, tuple) else str(log_result)
+        raise RuntimeError(f"NVRTC compilation failed:\\n{log}")
+'''
 
-echo "===== Architecture ====="
-uname -m
+new = '''    if err != nvrtc.nvrtcResult.NVRTC_SUCCESS:
+        # cuda.bindings NVRTC API requires:
+        #   nvrtcGetProgramLogSize(program)
+        #   nvrtcGetProgramLog(program, buffer)
+        size_result = nvrtc.nvrtcGetProgramLogSize(program)
+        size_err = size_result[0] if isinstance(size_result, tuple) else size_result
 
-echo "===== Memory ====="
-free -h
+        if size_err != nvrtc.nvrtcResult.NVRTC_SUCCESS:
+            raise RuntimeError(
+                f"NVRTC compilation failed: {err}; "
+                f"also failed to get compiler log: {size_err}"
+            )
 
-echo "===== Disk ====="
-df -h
+        log_size = size_result[1]
+        log_buffer = bytearray(log_size)
 
-echo "===== CUDA libs ====="
-ls -ld /usr/local/cuda*
+        log_result = nvrtc.nvrtcGetProgramLog(
+            program,
+            log_buffer,
+        )
 
-echo "===== TensorRT libs ====="
-ldd $(which trtexec) | grep -E "cuda|cudart|nvinfer" | head -30
+        log_err = log_result[0] if isinstance(log_result, tuple) else log_result
 
-echo "===== CUDA Python ====="
-python3 -c "import cuda; print('cuda-python: OK')" 2>&1 || true
+        if log_err != nvrtc.nvrtcResult.NVRTC_SUCCESS:
+            log_text = f"<unable to retrieve NVRTC log: {log_err}>"
+        else:
+            log_text = bytes(log_buffer).rstrip(b"\\\\x00").decode(
+                "utf-8",
+                errors="replace",
+            )
 
-echo "===== tegrastats ====="
-tegrastats --interval 1000
+        raise RuntimeError(
+            f"NVRTC compilation failed: {err}\\\\n"
+            f"Compiler log:\\\\n{log_text}"
+        )
+'''
+
+if old not in s:
+    raise SystemExit("Target block not found; file may differ.")
+
+s = s.replace(old, new)
+
+open(p, "w").write(s)
+
+print("[OK] Patched NVRTC compiler-log handling")
+PY
