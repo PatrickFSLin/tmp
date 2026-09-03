@@ -1,28 +1,15 @@
 """
-12j - VaVAM-B ego trajectory evaluation on DRIVE AGX Thor.
+12j - VaVAM-B ego trajectory evaluation shell for DRIVE AGX Thor.
 
 NO PyTorch.
 
-This script is the evaluation shell around the already validated 12i
-TensorRT + CUDA Euler implementation.
-
-The data/evaluation side is:
-    pkl + visual tokens
-        -> NumPy arrays
-        -> TRT/CUDA inference
-        -> prediction [1,1,6,2]
-        -> NumPy minADE
-
-IMPORTANT:
-The existing 12i runner should be reused for TRT/Euler. Do not create a
-second independent TRT implementation here.
-
-Only the adapter class below needs to be connected to 12i.
+This file first validates the dataset path/schema. The TensorRT/Euler adapter
+is intentionally isolated and will be connected to the already validated 12i
+GPU-resident implementation.
 """
 
 import argparse
 import os
-import time
 
 import numpy as np
 
@@ -46,30 +33,10 @@ DEFAULT_TOKENS = (
 
 class ThorVaVAMRunner:
     """
-    Adapter boundary for the already-working 12i implementation.
+    Adapter to the existing 12i TensorRT + CUDA Euler implementation.
 
-    Expected interface:
-
-        kv_cache = run_prefill(visual_tokens, command)
-
-        action_output = run_action(
-            kv_cache,
-            action_state,
-            command,
-            timestep,
-        )
-
-        action_state = euler_step(
-            action_state,
-            action_output,
-            timestep,
-        )
-
-    All inference tensors should remain GPU-resident inside 12i.
-
-    The methods intentionally raise NotImplementedError until we connect
-    the exact 12i code, because engine binding names/shapes must not be
-    guessed.
+    We intentionally do NOT guess binding names, tensor shapes, timestep
+    schedule, or random action initialization here.
     """
 
     def __init__(self, prefill_engine, action_engine):
@@ -83,8 +50,7 @@ class ThorVaVAMRunner:
 
     def run_prefill(self, visual_tokens, command):
         raise NotImplementedError(
-            "Connect this to the validated 12i GPU-resident "
-            "TensorRT Prefill implementation."
+            "Connect to the validated 12i Prefill runner."
         )
 
     def run_action(
@@ -95,8 +61,7 @@ class ThorVaVAMRunner:
         timestep,
     ):
         raise NotImplementedError(
-            "Connect this to the validated 12i GPU-resident "
-            "TensorRT Action implementation."
+            "Connect to the validated 12i Action runner."
         )
 
     def euler_step(
@@ -106,107 +71,8 @@ class ThorVaVAMRunner:
         timestep,
     ):
         raise NotImplementedError(
-            "Connect this to the validated 12i CUDA Euler kernel."
+            "Connect to the validated 12i CUDA Euler kernel."
         )
-
-
-def evaluate_one(
-    runner,
-    sample,
-    num_diffusion_steps=10,
-):
-    visual_tokens = np.ascontiguousarray(
-        sample["visual_tokens"]
-    )
-    command = np.asarray(
-        [[sample["high_level_command"]]],
-        dtype=np.int64,
-    )
-    ground_truth = np.asarray(
-        sample["positions"],
-        dtype=np.float32,
-    )[None, :, :]
-
-    print("\n=== Input to inference ===")
-    print(
-        f"visual_tokens : shape={visual_tokens.shape}, "
-        f"dtype={visual_tokens.dtype}"
-    )
-    print(
-        f"command       : shape={command.shape}, "
-        f"dtype={command.dtype}, value={command.tolist()}"
-    )
-    print(
-        f"ground_truth   : shape={ground_truth.shape}, "
-        f"dtype={ground_truth.dtype}"
-    )
-
-    # Do not generate a random action state here yet.
-    # The exact initial action distribution / shape must be copied from
-    # the validated 12i implementation.
-    #
-    # For deterministic PC-vs-Thor comparison, we will eventually feed
-    # exactly the same saved initial action tensor to both platforms.
-
-    t0 = time.perf_counter()
-
-    kv_cache = runner.run_prefill(
-        visual_tokens=visual_tokens,
-        command=command,
-    )
-
-    t_prefill = time.perf_counter()
-
-    action_state = None
-
-    for step in range(num_diffusion_steps):
-        # The exact timestep tensor and action_state initialization must
-        # come from 12i. Do not guess them here.
-        timestep = step
-
-        action_output = runner.run_action(
-            kv_cache=kv_cache,
-            action_state=action_state,
-            command=command,
-            timestep=timestep,
-        )
-
-        action_state = runner.euler_step(
-            action_state=action_state,
-            action_output=action_output,
-            timestep=timestep,
-        )
-
-    t_end = time.perf_counter()
-
-    prediction = np.asarray(
-        action_state,
-        dtype=np.float32,
-    )
-
-    if prediction.shape == (1, 6, 2):
-        prediction = prediction[:, None, :, :]
-    elif prediction.shape != (1, 1, 6, 2):
-        raise ValueError(
-            "Expected prediction shape [1,6,2] or [1,1,6,2], "
-            f"got {prediction.shape}"
-        )
-
-    loss, best_idx = min_ade(
-        prediction,
-        ground_truth,
-        return_idx=True,
-        reduction="sum",
-    )
-
-    return {
-        "prediction": prediction,
-        "ground_truth": ground_truth,
-        "minade": float(loss),
-        "best_idx": best_idx,
-        "prefill_ms": (t_prefill - t0) * 1000.0,
-        "e2e_ms": (t_end - t0) * 1000.0,
-    }
 
 
 def print_sample(sample):
@@ -217,22 +83,31 @@ def print_sample(sample):
         f"dtype={sample['visual_tokens'].dtype}"
     )
     print(
-        "command       : "
-        f"{sample['high_level_command']}"
+        "high_level_command : "
+        f"shape={sample['high_level_command'].shape}, "
+        f"dtype={sample['high_level_command'].dtype}, "
+        f"value={sample['high_level_command'].tolist()}"
     )
     print(
-        "GT positions  : "
+        "positions : "
         f"shape={sample['positions'].shape}, "
         f"dtype={sample['positions'].dtype}"
     )
     print(
-        "window_idx    : "
-        f"{sample['window_idx'].tolist()}"
+        "positions[-1] : "
+        f"shape={sample['positions'][-1].shape}"
+    )
+    print(
+        "window_idx : "
+        f"{sample['window_idx']}"
     )
 
-    print("\nGT trajectory:")
+    print("\nGT trajectory used by PC evaluation:")
     np.set_printoptions(precision=6, suppress=True)
-    print(sample["positions"])
+    print(sample["positions"][-1])
+
+    print("\nCommand used by PC evaluation:")
+    print(sample["high_level_command"][-1])
 
 
 def main():
@@ -260,11 +135,6 @@ def main():
         default=0,
     )
     parser.add_argument(
-        "--diffusion-steps",
-        type=int,
-        default=10,
-    )
-    parser.add_argument(
         "--dataset-only",
         action="store_true",
     )
@@ -274,6 +144,7 @@ def main():
     print("==============================================")
     print(" VaVAM-B Thor Ego Trajectory Evaluation (12j)")
     print(" NO PyTorch")
+    print(" Official pickle schema")
     print("==============================================")
 
     dataset = ThorEgoTrajectoryDataset(
@@ -281,45 +152,40 @@ def main():
         tokens_rootdir=args.tokens_root,
     )
 
-    print("\nDataset:")
-    print(
-        f"  valid evaluation sequences = {len(dataset)}"
-    )
-
-    if args.index < 0 or args.index >= len(dataset):
-        raise IndexError(
-            f"index={args.index}, dataset length={len(dataset)}"
-        )
+    print(f"\nDataset size: {len(dataset)}")
 
     sample = dataset[args.index]
     print_sample(sample)
+
+    # PC evaluation uses:
+    #
+    # commands = batch["high_level_command"][:, -1:]
+    # ground_truth = batch["positions"][:, -1]
+    #
+    # For one sample:
+    commands = sample["high_level_command"][-1:].reshape(1, 1)
+    ground_truth = sample["positions"][-1:][:, :, :]
+
+    print("\n=== Exact PC-equivalent evaluation inputs ===")
+    print(
+        f"visual_tokens : {sample['visual_tokens'].shape}"
+    )
+    print(
+        f"commands      : {commands.shape}, "
+        f"{commands.tolist()}"
+    )
+    print(
+        f"ground_truth  : {ground_truth.shape}"
+    )
 
     if args.dataset_only:
         print("\nDATASET-ONLY PASS")
         return
 
-    runner = ThorVaVAMRunner(
-        prefill_engine=args.prefill_engine,
-        action_engine=args.action_engine,
+    print(
+        "\nDataset stage passed. Next step is to connect the existing "
+        "12i TensorRT + CUDA Euler runner."
     )
-
-    result = evaluate_one(
-        runner=runner,
-        sample=sample,
-        num_diffusion_steps=args.diffusion_steps,
-    )
-
-    print("\n=== Evaluation result ===")
-    print(f"minADE        : {result['minade']:.6f} m")
-    print(f"best mode     : {result['best_idx']}")
-    print(f"prefill       : {result['prefill_ms']:.3f} ms")
-    print(f"E2E inference : {result['e2e_ms']:.3f} ms")
-
-    print("\nPrediction:")
-    print(result["prediction"][0, 0])
-
-    print("\nGround truth:")
-    print(result["ground_truth"][0])
 
 
 if __name__ == "__main__":
