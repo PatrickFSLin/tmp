@@ -1,16 +1,29 @@
 """
-Minimal nuScenes ego-trajectory dataset loader for DRIVE AGX Thor.
+Minimal NumPy-only implementation of VaVAM's nuScenes EgoTrajectoryDataset.
 
 IMPORTANT:
-- No PyTorch.
-- No torchvision / PIL.
-- No full VideoActionModel repository.
-- Returns NumPy arrays so they can be passed directly to the existing
-  TensorRT / cuda-python inference pipeline.
+This version follows the ACTUAL pickle schema used by the official
+VideoActionModel EgoTrajectoryDataset:
 
-Required data:
-    nuscenes_mini_data_cleaned.pkl
-    tokens/**/*.npy
+    record["scene"]["name"]
+    record["CAM_FRONT"]["timestamp"]
+    record["CAM_FRONT"]["file_path"]
+    record["CAM_FRONT"]["ego_to_world_tran"]
+    record["CAM_FRONT"]["ego_to_world_rot"]
+
+No PyTorch / torchvision / PIL / pyquaternion / full VideoActionModel repo.
+
+The returned shapes intentionally match the official dataset because the
+PC evaluation does:
+
+    visual_tokens = batch["visual_tokens"]
+    commands = batch["high_level_command"][:, -1:]
+    ground_truth = batch["positions"][:, -1]
+
+Thus:
+    visual_tokens       : [8, H, W]
+    high_level_command  : [8]
+    positions           : [8, 6, 2]
 """
 
 import os
@@ -28,21 +41,7 @@ class HighLevelCommand:
 
 
 class ThorEgoTrajectoryDataset:
-    """
-    Minimal NumPy-only equivalent for the fields needed by trajectory eval.
-
-    Output of dataset[idx]:
-        visual_tokens       : np.ndarray, integer
-        high_level_command  : np.int64 scalar
-        positions           : np.float32 [6, 2]
-        window_idx          : np.int64 [14]
-
-    The default sequence configuration follows the PC evaluation:
-        8 observation frames
-        6 future frames
-        subsampling factor = 1
-        CAM_FRONT
-    """
+    COMMAND_DISTANCE_THRESHOLD = 2.0
 
     def __init__(
         self,
@@ -56,7 +55,7 @@ class ThorEgoTrajectoryDataset:
     ):
         self.pickle_path = os.path.expanduser(pickle_path)
         self.tokens_rootdir = os.path.expanduser(tokens_rootdir)
-        self.camera_name = camera
+        self.camera = camera
         self.sequence_length = sequence_length
         self.action_length = action_length
         self.subsampling_factor = subsampling_factor
@@ -68,275 +67,466 @@ class ThorEgoTrajectoryDataset:
             raise FileNotFoundError(self.tokens_rootdir)
 
         with open(self.pickle_path, "rb") as f:
-            self.pickle_data = pickle.load(f)
+            pickle_data = pickle.load(f)
 
-        self._prepare_data()
-
-    @staticmethod
-    def _scene_name(record: Dict[str, Any]) -> str:
-        scene = record["scene"]
-        if isinstance(scene, dict):
-            return str(scene.get("name", scene.get("token", "")))
-        return str(getattr(scene, "name", scene))
-
-    @staticmethod
-    def _camera_name(record: Dict[str, Any]) -> str:
-        camera = record["camera"]
-        if isinstance(camera, dict):
-            return str(camera.get("channel", camera.get("name", "")))
-        return str(getattr(camera, "channel",
-                           getattr(camera, "name", camera)))
-
-    @staticmethod
-    def _timestamp(record: Dict[str, Any]) -> int:
-        camera = record["camera"]
-        if isinstance(camera, dict):
-            return int(camera["timestamp"])
-        return int(camera.timestamp)
-
-    @staticmethod
-    def _pose_translation(ego_pose: Any) -> np.ndarray:
-        if isinstance(ego_pose, dict):
-            value = ego_pose["translation"]
-        else:
-            value = ego_pose.translation
-        return np.asarray(value, dtype=np.float64)
-
-    @staticmethod
-    def _pose_rotation(ego_pose: Any) -> np.ndarray:
-        """
-        Return quaternion as [w, x, y, z].
-
-        nuScenes / pyquaternion convention is [w, x, y, z].
-        """
-        if isinstance(ego_pose, dict):
-            value = ego_pose["rotation"]
-        else:
-            value = ego_pose.rotation
-
-        # pyquaternion-like object
-        if hasattr(value, "elements"):
-            value = value.elements
-
-        q = np.asarray(value, dtype=np.float64).reshape(-1)
-        if q.size != 4:
-            raise ValueError(
-                f"Expected quaternion with 4 elements, got shape {q.shape}"
+        # IMPORTANT: official code sorts the ORIGINAL records by:
+        # (scene["name"], record[camera]["timestamp"])
+        pickle_data.sort(
+            key=lambda x: (
+                x["scene"]["name"],
+                x[self.camera]["timestamp"],
             )
+        )
 
-        # Official nuScenes/pyquaternion convention.
-        return q
+        self.pickle_data = pickle_data
+        self.sequences_indices = self.get_sequence_indices()
 
-    @staticmethod
-    def _quat_conjugate(q: np.ndarray) -> np.ndarray:
-        return np.array([q[0], -q[1], -q[2], -q[3]], dtype=np.float64)
-
-    @staticmethod
-    def _quat_rotate(q: np.ndarray, v: np.ndarray) -> np.ndarray:
+    def get_sequence_indices(self) -> np.ndarray:
         """
-        Rotate 3D vector v by unit quaternion q=[w,x,y,z].
+        Exact sequence-index logic from official EgoTrajectoryDataset.
 
-        Implemented directly with NumPy; no pyquaternion required.
+        The official code checks:
+            sequence_length observation frames
+            + action_length future frames
+
+        but stores only the observation-frame indices.
+        """
+        indices = []
+
+        max_temporal_index = (
+            self.subsampling_factor
+            * (self.sequence_length + self.action_length)
+        )
+
+        for sequence_start_index in range(len(self.pickle_data)):
+            is_valid_sequence = True
+            previous_sample = None
+            sequence_indices = []
+
+            for t in range(
+                0,
+                max_temporal_index,
+                self.subsampling_factor,
+            ):
+                temporal_index = sequence_start_index + t
+
+                if temporal_index >= len(self.pickle_data):
+                    is_valid_sequence = False
+                    break
+
+                sample = self.pickle_data[temporal_index]
+
+                if (
+                    previous_sample is not None
+                    and sample["scene"]["name"]
+                    != previous_sample["scene"]["name"]
+                ):
+                    is_valid_sequence = False
+                    break
+
+                if t < self.sequence_length * self.subsampling_factor:
+                    sequence_indices.append(temporal_index)
+
+                previous_sample = sample
+
+            if is_valid_sequence:
+                indices.append(sequence_indices)
+
+        return np.asarray(indices, dtype=np.int64)
+
+    def __len__(self):
+        return len(self.sequences_indices)
+
+    @staticmethod
+    def quaternion_inverse(q: np.ndarray) -> np.ndarray:
+        q = np.asarray(q, dtype=np.float64)
+        return np.asarray(
+            [q[0], -q[1], -q[2], -q[3]],
+            dtype=np.float64,
+        )
+
+    @staticmethod
+    def quaternion_multiply(
+        q1: np.ndarray,
+        q2: np.ndarray,
+    ) -> np.ndarray:
+        w1, x1, y1, z1 = q1
+        w2, x2, y2, z2 = q2
+
+        return np.asarray(
+            [
+                w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+                w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+                w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+                w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+            ],
+            dtype=np.float64,
+        )
+
+    @staticmethod
+    def quaternion_to_rotation_matrix(q: np.ndarray) -> np.ndarray:
+        """
+        Equivalent to pyquaternion.Quaternion(q).rotation_matrix.
+
+        q format: [w, x, y, z]
         """
         q = np.asarray(q, dtype=np.float64)
-        v = np.asarray(v, dtype=np.float64)
+        norm = np.linalg.norm(q)
+        if norm == 0:
+            raise ValueError("Zero-norm quaternion")
+        q = q / norm
 
         w, x, y, z = q
-        qvec = np.array([x, y, z], dtype=np.float64)
 
-        # Equivalent to q * [0,v] * q^-1, optimized for vectors.
-        return (
-            2.0 * np.dot(qvec, v) * qvec
-            + (w * w - np.dot(qvec, qvec)) * v
-            + 2.0 * w * np.cross(qvec, v)
+        return np.asarray(
+            [
+                [
+                    1 - 2 * (y * y + z * z),
+                    2 * (x * y - z * w),
+                    2 * (x * z + y * w),
+                ],
+                [
+                    2 * (x * y + z * w),
+                    1 - 2 * (x * x + z * z),
+                    2 * (y * z - x * w),
+                ],
+                [
+                    2 * (x * z - y * w),
+                    2 * (y * z + x * w),
+                    1 - 2 * (x * x + y * y),
+                ],
+            ],
+            dtype=np.float64,
         )
 
     @classmethod
-    def _relative_position(
+    def rotate_point(
         cls,
-        current_translation: np.ndarray,
-        current_rotation: np.ndarray,
-        target_translation: np.ndarray,
+        point: np.ndarray,
+        quaternion: np.ndarray,
     ) -> np.ndarray:
-        delta = np.asarray(target_translation) - np.asarray(current_translation)
-        return cls._quat_rotate(cls._quat_conjugate(current_rotation), delta)
+        """
+        Rotate a 3D point with quaternion and return x,y components.
 
-    def _prepare_data(self):
-        records = [
-            r for r in self.pickle_data
-            if self._camera_name(r) == self.camera_name
-        ]
+        This matches the official rotate_point(), which represents the
+        2D point as [0, x, y, 0] before quaternion rotation and returns
+        the rotated [x, y].
+        """
+        point = np.asarray(point, dtype=np.float64)
+        q = np.asarray(quaternion, dtype=np.float64)
 
-        records.sort(
-            key=lambda r: (self._scene_name(r), self._timestamp(r))
+        # Official dataset only needs the x/y components. Its point_quat is:
+        # [0, point[0], point[1], 0].
+        v3 = np.asarray(
+            [point[0], point[1], 0.0],
+            dtype=np.float64,
         )
 
-        self.data = records
+        R = cls.quaternion_to_rotation_matrix(q)
+        rotated = R @ v3
 
-        scene_indices: Dict[str, List[int]] = {}
-        for idx, record in enumerate(self.data):
-            scene = self._scene_name(record)
-            scene_indices.setdefault(scene, []).append(idx)
+        return rotated[:2]
 
-        self.scene_indices = scene_indices
+    @classmethod
+    def get_high_level_command(
+        cls,
+        translation: np.ndarray,
+        rotation: np.ndarray,
+        future_translation: np.ndarray,
+        future_rotation: np.ndarray,
+    ) -> int:
+        """
+        Equivalent to the official homogeneous-transform implementation.
 
-        step = self.subsampling_factor
-        total_frames = self.sequence_length + self.action_length
+        Output coordinate system is x-forward, y-left.
+        """
+        cur_R = cls.quaternion_to_rotation_matrix(rotation)
 
-        # A window consists of:
-        #   8 observation frames + 6 future frames
-        # with the configured subsampling factor.
-        span = (total_frames - 1) * step + 1
+        # Current ego -> world:
+        # [R, t]
+        # World -> current ego:
+        # R^T, -R^T t
+        future_pos_ego = (
+            cur_R.T
+            @ (
+                np.asarray(future_translation, dtype=np.float64)
+                - np.asarray(translation, dtype=np.float64)
+            )
+        )
 
-        self.window_indices: List[List[int]] = []
+        if future_pos_ego[1] > cls.COMMAND_DISTANCE_THRESHOLD:
+            return HighLevelCommand.LEFT
 
-        for indices in self.scene_indices.values():
-            if len(indices) < span:
-                continue
+        if future_pos_ego[1] < -cls.COMMAND_DISTANCE_THRESHOLD:
+            return HighLevelCommand.RIGHT
 
-            for start in range(0, len(indices) - span + 1):
-                window = indices[start:start + span:step]
-                if len(window) == total_frames:
-                    self.window_indices.append(window)
+        return HighLevelCommand.STRAIGHT
 
-    def __len__(self):
-        return len(self.window_indices)
+    @classmethod
+    def sequence_of_positions_to_trajectory(
+        cls,
+        positions: np.ndarray,
+        rotations: np.ndarray,
+    ):
+        """
+        Equivalent to official sequence_of_positions_to_trajectory().
 
-    def _record_path(self, record: Dict[str, Any]) -> str:
-        path = record.get("path")
+        Input:
+            positions  : [action_length+1, 2]
+            rotations  : [action_length+1, 4]
 
-        if path is None and isinstance(record.get("camera"), dict):
-            camera = record["camera"]
-            path = camera.get("path")
+        Output:
+            relative_positions : [action_length, 2]
+            relative_rotations : [action_length, 4]
+        """
+        positions = np.asarray(positions, dtype=np.float64)
+        rotations = np.asarray(rotations, dtype=np.float64)
 
-        if path is None:
-            raise KeyError(
-                "Cannot find image path. Expected record['path'] or "
-                "record['camera']['path']."
+        initial_position = positions[0]
+        initial_rotation = rotations[0]
+        initial_rotation_inv = cls.quaternion_inverse(initial_rotation)
+
+        relative_positions = positions[1:] - initial_position
+
+        for i in range(len(relative_positions)):
+            relative_positions[i] = cls.rotate_point(
+                relative_positions[i],
+                initial_rotation_inv,
             )
 
-        return os.path.expanduser(str(path))
-
-    def _token_path(self, record: Dict[str, Any]) -> str:
-        image_path = self._record_path(record)
-        token_rel = os.path.splitext(image_path)[0] + ".npy"
-
-        candidates = []
-
-        if os.path.isabs(token_rel):
-            candidates.append(token_rel)
-
-            # Handle PC absolute path such as:
-            # /home/patrick/VideoActionModel/data/nuScenes-mini/...
-            marker = "/nuScenes-mini/"
-            if marker in token_rel:
-                relative = token_rel.split(marker, 1)[1]
-                candidates.append(
-                    os.path.join(self.tokens_rootdir, relative)
+        relative_rotations = np.asarray(
+            [
+                cls.quaternion_multiply(
+                    initial_rotation_inv,
+                    q,
                 )
-        else:
-            candidates.append(
-                os.path.join(self.tokens_rootdir, token_rel)
-            )
-
-        candidates.append(
-            os.path.join(
-                self.tokens_rootdir,
-                os.path.basename(token_rel),
-            )
+                for q in rotations[1:]
+            ],
+            dtype=np.float64,
         )
 
-        for path in candidates:
-            if os.path.isfile(path):
-                return path
+        return relative_positions, relative_rotations
 
-        # Last resort: basename recursive search.
-        basename = os.path.basename(token_rel)
-        matches = []
+    def _token_path(self, file_path: str) -> str:
+        """
+        EXACT official convention:
 
-        for root, _, files in os.walk(self.tokens_rootdir):
-            if basename in files:
-                matches.append(os.path.join(root, basename))
+            os.path.join(tokens_rootdir,
+                         sample["file_path"].replace(".jpg", ".npy"))
+        """
+        relative_token_path = file_path.replace(".jpg", ".npy")
 
-        if len(matches) == 1:
-            return matches[0]
+        candidate = os.path.join(
+            self.tokens_rootdir,
+            relative_token_path,
+        )
+
+        if os.path.isfile(candidate):
+            return candidate
+
+        # Helpful fallback for a PC absolute path accidentally stored in the
+        # pickle. Do not change the normal path behavior.
+        if os.path.isabs(relative_token_path):
+            marker = "/nuScenes-mini/"
+            if marker in relative_token_path:
+                relative = relative_token_path.split(marker, 1)[1]
+                candidate = os.path.join(
+                    self.tokens_rootdir,
+                    relative,
+                )
+                if os.path.isfile(candidate):
+                    return candidate
 
         raise FileNotFoundError(
             "\nVisual token file not found.\n"
-            f"image path     : {image_path}\n"
-            f"token basename : {basename}\n"
-            f"tokens root    : {self.tokens_rootdir}\n"
-            f"candidates     : {candidates}\n"
-            f"recursive hits : {len(matches)}"
+            f"file_path     : {file_path}\n"
+            f"token path    : {candidate}\n"
+            f"tokens root   : {self.tokens_rootdir}\n"
         )
 
-    def _load_visual_tokens(self, record: Dict[str, Any]) -> np.ndarray:
-        path = self._token_path(record)
-        tokens = np.load(path)
+    def __getitem__(self, index: int) -> dict:
+        data_visual_tokens = []
+        data_high_level_command = []
+        data_positions = []
+        data_rotations = []
+        data_scene_names = []
+        data_file_paths = []
 
-        # PC VaVAM visual tokens are integer token IDs.
-        if not np.issubdtype(tokens.dtype, np.integer):
-            tokens = tokens.astype(np.int64)
+        first_frame_timestamp = None
 
-        return np.ascontiguousarray(tokens.astype(np.int64, copy=False))
-
-    def __getitem__(self, idx: int) -> Dict[str, Any]:
-        window = self.window_indices[idx]
-
-        obs_indices = window[:self.sequence_length]
-        future_indices = window[
-            self.sequence_length:
-            self.sequence_length + self.action_length
+        # Exact official behavior:
+        temporal_indices = self.sequences_indices[index][
+            : self.sequence_length
         ]
 
-        ref_record = self.data[obs_indices[-1]]
-        ref_pose = ref_record["ego_pose"]
+        # IMPORTANT:
+        # Keep temporal_index as the loop variable. After this loop it points
+        # to the LAST observation frame, exactly as in the official code.
+        for temporal_index in temporal_indices:
+            sample = self.pickle_data[temporal_index][self.camera]
 
-        ref_translation = self._pose_translation(ref_pose)
-        ref_rotation = self._pose_rotation(ref_pose)
+            data_scene_names.append(
+                self.pickle_data[temporal_index]["scene"]["name"]
+            )
+            data_file_paths.append(sample["file_path"])
 
-        visual_tokens = [
-            self._load_visual_tokens(self.data[i])
-            for i in obs_indices
-        ]
-        visual_tokens = np.stack(visual_tokens, axis=0)
+            timestamp = sample["timestamp"]
 
-        # Official command logic:
-        # final future position in current ego frame
-        final_pose = self.data[future_indices[-1]]["ego_pose"]
-        final_translation = self._pose_translation(final_pose)
+            if first_frame_timestamp is None:
+                first_frame_timestamp = timestamp
 
-        relative_final = self._relative_position(
-            ref_translation,
-            ref_rotation,
-            final_translation,
-        )
+            relative_timestamp = (
+                timestamp - first_frame_timestamp
+            ) * 1e-6
 
-        if relative_final[1] > self.command_distance_threshold:
-            command = HighLevelCommand.LEFT
-        elif relative_final[1] < -self.command_distance_threshold:
-            command = HighLevelCommand.RIGHT
-        else:
-            command = HighLevelCommand.STRAIGHT
+            if self.tokens_rootdir is not None:
+                token_path = self._token_path(sample["file_path"])
+                tokens = np.load(token_path).astype(
+                    np.int64,
+                    copy=False,
+                )
+                data_visual_tokens.append(
+                    np.ascontiguousarray(tokens)
+                )
 
+        # The official code now uses the LAST observation frame
+        # (temporal_index) as the reference for the 6-step action trajectory.
         positions = []
-        for i in future_indices:
-            pose = self.data[i]["ego_pose"]
-            translation = self._pose_translation(pose)
+        rotations = []
+
+        for j in range(
+            0,
+            (1 + self.action_length) * self.subsampling_factor,
+            self.subsampling_factor,
+        ):
+            sample = self.pickle_data[
+                temporal_index + j
+            ][self.camera]
 
             positions.append(
-                self._relative_position(
-                    ref_translation,
-                    ref_rotation,
-                    translation,
+                np.asarray(
+                    sample["ego_to_world_tran"][:2],
+                    dtype=np.float64,
+                )
+            )
+            rotations.append(
+                np.asarray(
+                    sample["ego_to_world_rot"],
+                    dtype=np.float64,
                 )
             )
 
-        positions = np.asarray(positions, dtype=np.float32)
+        positions = np.asarray(positions, dtype=np.float64)
+        rotations = np.asarray(rotations, dtype=np.float64)
+
+        current_sample = self.pickle_data[temporal_index][self.camera]
+        future_sample = self.pickle_data[
+            temporal_index + self.action_length
+        ][self.camera]
+
+        high_level_command = self.get_high_level_command(
+            current_sample["ego_to_world_tran"],
+            current_sample["ego_to_world_rot"],
+            future_sample["ego_to_world_tran"],
+            future_sample["ego_to_world_rot"],
+        )
+
+        relative_position, relative_rotation = (
+            self.sequence_of_positions_to_trajectory(
+                positions,
+                rotations,
+            )
+        )
+
+        # The official dataset appends one [6,2] trajectory for EACH of the
+        # 8 observation frames.
+        #
+        # IMPORTANT:
+        # In the official code, the same final temporal_index is used after
+        # the observation loop, so data["positions"] contains one trajectory
+        # per observation frame only because each observation iteration runs
+        # the trajectory extraction in the original __getitem__ structure.
+        #
+        # For exact PC evaluation semantics, what matters downstream is:
+        #     positions[-1] -> [6,2]
+        #
+        # We construct the full [8,6,2] by evaluating each observation frame
+        # as reference below.
+        all_relative_positions = []
+        all_relative_rotations = []
+        all_commands = []
+
+        for obs_index in temporal_indices:
+            obs_sample = self.pickle_data[obs_index][self.camera]
+
+            obs_positions = []
+            obs_rotations = []
+
+            for j in range(
+                0,
+                (1 + self.action_length) * self.subsampling_factor,
+                self.subsampling_factor,
+            ):
+                s = self.pickle_data[
+                    obs_index + j
+                ][self.camera]
+
+                obs_positions.append(
+                    np.asarray(
+                        s["ego_to_world_tran"][:2],
+                        dtype=np.float64,
+                    )
+                )
+                obs_rotations.append(
+                    np.asarray(
+                        s["ego_to_world_rot"],
+                        dtype=np.float64,
+                    )
+                )
+
+            obs_positions = np.asarray(obs_positions)
+            obs_rotations = np.asarray(obs_rotations)
+
+            rel_pos, rel_rot = (
+                self.sequence_of_positions_to_trajectory(
+                    obs_positions,
+                    obs_rotations,
+                )
+            )
+
+            future_s = self.pickle_data[
+                obs_index + self.action_length
+            ][self.camera]
+
+            cmd = self.get_high_level_command(
+                obs_sample["ego_to_world_tran"],
+                obs_sample["ego_to_world_rot"],
+                future_s["ego_to_world_tran"],
+                future_s["ego_to_world_rot"],
+            )
+
+            all_relative_positions.append(rel_pos.astype(np.float32))
+            all_relative_rotations.append(rel_rot.astype(np.float32))
+            all_commands.append(cmd)
 
         return {
-            "positions": positions[:, :2],
-            "high_level_command": np.int64(command),
-            "visual_tokens": visual_tokens,
-            "window_idx": np.asarray(window, dtype=np.int64),
+            "visual_tokens": np.stack(
+                data_visual_tokens,
+                axis=0,
+            ),
+            "high_level_command": np.asarray(
+                all_commands,
+                dtype=np.int64,
+            ),
+            "positions": np.stack(
+                all_relative_positions,
+                axis=0,
+            ),
+            "rotations": np.stack(
+                all_relative_rotations,
+                axis=0,
+            ),
+            "scene_names": data_scene_names,
+            "file_paths": data_file_paths,
+            "window_idx": np.int64(index),
         }
