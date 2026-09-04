@@ -1,8 +1,24 @@
-python3 - <<'PY'
-import numpy as np
-from pathlib import Path
+grep -nE "M=|M |num_modes|num_mode|modes|action.*shape|shape.*action|mode" \
+12j_vavam_B_evaluate_ego_trajectory.py | head -80
 
-for p in sorted(Path(".").glob("*official*.npy")):
-    x = np.load(p)
-    print(f"{p.name:45s} shape={x.shape} dtype={x.dtype}")
+python3 - <<'PY'
+import tensorrt as trt
+
+logger = trt.Logger(trt.Logger.WARNING)
+
+for fn in [
+    "../Engines/vavam_joint_kv_prefill_B_v10_fp16.engine",
+    "../Engines/vavam_joint_action_B_fp16.engine",
+]:
+    print("\n" + "="*80)
+    print(fn)
+
+    with open(fn, "rb") as f:
+        engine = trt.Runtime(logger).deserialize_cuda_engine(f.read())
+
+    for i in range(engine.num_io_tensors):
+        name = engine.get_tensor_name(i)
+        mode = engine.get_tensor_mode(name)
+        shape = engine.get_tensor_shape(name)
+        print(f"{mode.name:6s} {name:40s} {shape}")
 PY
