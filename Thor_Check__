@@ -2,23 +2,7 @@ python3 - <<'PY'
 import numpy as np
 from pathlib import Path
 
-p = Path.home() / "vblkdev2/VaVAM_Thor/pc_reference/initial_action.npy"
-
-x = np.load(p)
-
-x16 = x.astype(np.float16)
-x32_back = x16.astype(np.float32)
-
-diff = np.abs(x - x32_back)
-
-print("original dtype :", x.dtype)
-print("shape           :", x.shape)
-print("max FP32->FP16->FP32 error :", diff.max())
-print("mean error                   :", diff.mean())
-print()
-print("original:")
-print(x)
-print()
-print("round-trip:")
-print(x32_back)
+for p in sorted(Path(".").glob("*official*.npy")):
+    x = np.load(p)
+    print(f"{p.name:45s} shape={x.shape} dtype={x.dtype}")
 PY
