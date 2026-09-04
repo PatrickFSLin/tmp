@@ -1,38 +1,16 @@
-ptx_size_result = nvrtc.nvrtcGetPTXSize(program)
+python3 - <<'PY'
+import numpy as np
+from pathlib import Path
 
-ptx_size_err = (
-    ptx_size_result[0]
-    if isinstance(ptx_size_result, tuple)
-    else ptx_size_result
-)
+p = Path.home() / "vblkdev2/VaVAM_Thor/pc_reference/initial_action.npy"
 
-if ptx_size_err != nvrtc.nvrtcResult.NVRTC_SUCCESS:
-    raise RuntimeError(
-        f"nvrtcGetPTXSize failed: {ptx_size_result}"
-    )
+x = np.load(p)
 
-ptx_size = (
-    ptx_size_result[1]
-    if isinstance(ptx_size_result, tuple)
-    else None
-)
-
-ptx_buffer = bytearray(ptx_size)
-
-ptx_result = nvrtc.nvrtcGetPTX(
-    program,
-    ptx_buffer,
-)
-
-ptx_err = (
-    ptx_result[0]
-    if isinstance(ptx_result, tuple)
-    else ptx_result
-)
-
-if ptx_err != nvrtc.nvrtcResult.NVRTC_SUCCESS:
-    raise RuntimeError(
-        f"nvrtcGetPTX failed: {ptx_result}"
-    )
-
-ptx = bytes(ptx_buffer)
+print("shape:", x.shape)
+print("dtype:", x.dtype)
+print("min:", x.min())
+print("max:", x.max())
+print("mean:", x.mean())
+print("values:")
+print(x)
+PY
