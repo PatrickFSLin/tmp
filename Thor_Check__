@@ -1,13 +1,14 @@
-else:
-    traj_store = np.asarray(
-        trajectories,
-        dtype=np.float32
-    ).reshape(args.num_trajectories, 6, 2)
+trajectory = np.asarray(trajectory, dtype=np.float32)
 
-    ade_store = np.asarray(
-        ades,
-        dtype=np.float32
-    ).reshape(args.num_trajectories)
+# Remove only leading singleton dimensions.
+while trajectory.ndim > 2 and trajectory.shape[0] == 1:
+    trajectory = trajectory[0]
 
-    predictions_all[local_idx, :, :, :] = traj_store
-    ade_all[local_idx, :] = ade_store
+if trajectory.shape != (6, 2):
+    raise RuntimeError(
+        f"Unexpected normalized trajectory shape at "
+        f"sample {sample_index}, traj {traj_idx}: "
+        f"{trajectory.shape}"
+    )
+
+trajectories.append(trajectory)
