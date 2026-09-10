@@ -1,5 +1,13 @@
-print("DEBUG trajectories type:", type(trajectories))
-print("DEBUG trajectories shape:", np.asarray(trajectories).shape)
-print("DEBUG sliced shape:", np.asarray(trajectories)[:, 0, :, :].shape)
-print("DEBUG reshaped shape:", np.asarray(trajectories).reshape(args.num_trajectories, 6, 2).shape)
-print("DEBUG target shape:", predictions_all[local_idx].shape)
+else:
+    traj_store = np.asarray(
+        trajectories,
+        dtype=np.float32
+    ).reshape(args.num_trajectories, 6, 2)
+
+    ade_store = np.asarray(
+        ades,
+        dtype=np.float32
+    ).reshape(args.num_trajectories)
+
+    predictions_all[local_idx, :, :, :] = traj_store
+    ade_all[local_idx, :] = ade_store
